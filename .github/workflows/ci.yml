@@ -33,11 +33,20 @@ jobs:
 
       - name: Golden model self-tests
         run: |
+          PYTHONPATH=systolic_array/model python systolic_array/model/delay_model.py
           PYTHONPATH=systolic_array/model python systolic_array/model/pe_model.py
           PYTHONPATH=systolic_array/model python systolic_array/model/systolic_array_model.py
+          PYTHONPATH=systolic_array/model python systolic_array/model/ctrl_fsm_model.py
+          PYTHONPATH=systolic_array/model python systolic_array/model/requant_model.py
 
       - name: systolic array sweep
         run: make sweep-array
+
+      - name: ctrl_fsm sweep
+        run: make sweep-ctrl
+
+      - name: requant sweep
+        run: make sweep-requant
 
       - name: Upload results
         if: always()
