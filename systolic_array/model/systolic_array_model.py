@@ -230,3 +230,5 @@ if __name__ == "__main__":
     chk("back-to-back tile independent", m2.run_tile(a2, b2), expected_matmul(a2, b2))
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
+
+    raise SystemExit(1 if fails else 0)

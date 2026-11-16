@@ -4,6 +4,40 @@
 //feeder supplies the operand bytes MEM_LATENCY cycles later. 
 //the tile tags travel thru delay lines of the same depth so that they arrive at the array boundry on the same 
 //edge as the operands they tag. 
+//
+// interface
+//   start/k_in/ready : one tile per handshake. a tile is accepted on an edge
+//                      where start & ready. ready is low under stall, so a
+//                      start pulsed during a stall is not taken; hold start
+//                      until ready. k_in is the tile depth K (>= 1). a start
+//                      with k_in == 0 is ignored so hardware cannot hang.
+//   busy             : high from the edge that accepts a tile until the edge
+//                      after done. not gated by stall.
+//   op_req/k_idx     : slice request to the feeder, k_idx = 0 .. K-1, one per
+//                      enabled cycle. the operands for a slice must reach the
+//                      array MEM_LATENCY enabled edges after it is requested,
+//                      and the feeder pipeline must hold under stall.
+//   arr_*            : drive systolic_array directly. arr_en = ~stall.
+//   c_valid/c_row    : c_out of the array holds row c_row. rows come out
+//                      N-1 first, then N-2 .. 0, one per enabled cycle.
+//   done             : one enabled cycle, the cycle after row 0.
+//
+// stall convention: stall freezes every register here and in the array.
+//   outputs hold their value, so an event (op_req, c_valid, done) only counts
+//   on a cycle where stall is low. done and c_valid stretch under stall;
+//   consumers qualify them with ~stall.
+//
+// latency, in enabled edges, from the edge that accepts start:
+//   first slice sampled by the array : MEM_LATENCY + 1
+//   last slice sampled by the array  : MEM_LATENCY + K
+//   row N-1 on c_out, c_valid rises  : MEM_LATENCY + K + 2N (LAST_TO_DRAIN_READY
+//                                      after the last slice is sampled)
+//   done rises                       : MEM_LATENCY + K + 3N
+//   ready rises again                : MEM_LATENCY + K + 3N + 1
+// an output that rises after edge e is sampled by its consumer at edge e + 1.
+//
+// reset is synchronous and wins over stall. it clears the tag delay lines too,
+// so a tile cut off by reset leaves nothing behind (the array shares the reset).
 
 module ctrl_fsm #( 
     parameter int N = 8, 
@@ -38,7 +72,7 @@ module ctrl_fsm #(
     ); 
 
     // constants 
-    localparam int WAIT_CYCLE = 2 * N;
+    localparam int WAIT_CYCLES = 2 * N;
     localparam int WAIT_W =  $clog2(WAIT_CYCLES + 1);
     localparam logic [2:0] S_IDLE   = 3'd0,
                            S_STREAM = 3'd1,
@@ -75,8 +109,9 @@ module ctrl_fsm #(
     //combinational outputs 
     assign arr_en = ~stall;
 
-a   assign ready = (state == S_IDLE);
-    assign busy  = ~ready;
+    // ready drops under stall so start & ready is the whole handshake
+    assign ready = (state == S_IDLE) & ~stall;
+    assign busy  = (state != S_IDLE);
 
     // Sequencer
     always_ff @(posedge clk) begin
@@ -109,7 +144,8 @@ a   assign ready = (state == S_IDLE);
                 S_IDLE: begin
                     // start is ignored while busy, by construction: this arm is
                     // only reachable from S_IDLE.
-                    if (start) begin
+                    // k_in == 0 would never hit the k_idx == k_lat - 1 compare
+                    if (start && (k_in != '0)) begin
                         k_lat     <= k_in;
                         k_idx     <= '0;
                         op_req    <= 1'b1;
@@ -180,8 +216,10 @@ a   assign ready = (state == S_IDLE);
         if (K_WIDTH < 1)
             $fatal(1, "ctrl_fsm: K_WIDTH must be >= 1 (got %0d)", K_WIDTH);
     end
+    // +ctrl_fsm_allow_k0 lets the testbench prove the k_in == 0 start is ignored
     always @(posedge clk) begin
-        if (!reset && !stall && (state == S_IDLE) && start && (k_in == 0))
+        if (!reset && !stall && (state == S_IDLE) && start && (k_in == 0)
+            && !$test$plusargs("ctrl_fsm_allow_k0"))
             $fatal(1, "ctrl_fsm: k_in must be >= 1");
     end
 `endif
