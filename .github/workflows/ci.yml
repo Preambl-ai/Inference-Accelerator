@@ -23,7 +23,7 @@ jobs:
           iverilog -V | head -1
 
       - name: Install cocotb
-        run: pip install cocotb==2.0.1
+        run: pip install cocotb==2.0.1 numpy
 
       - name: Run DEPTH sweep
         run: make sweep
@@ -38,6 +38,9 @@ jobs:
           PYTHONPATH=systolic_array/model python systolic_array/model/systolic_array_model.py
           PYTHONPATH=systolic_array/model python systolic_array/model/ctrl_fsm_model.py
           PYTHONPATH=systolic_array/model python systolic_array/model/requant_model.py
+          python memory/model/bram_model.py
+          python axis/model/skid_buffer_model.py
+          PYTHONPATH=systolic_array/model python gemm_tile/model/gemm_tile_model.py
 
       - name: systolic array sweep
         run: make sweep-array
@@ -47,6 +50,15 @@ jobs:
 
       - name: requant sweep
         run: make sweep-requant
+
+      - name: bram sweep
+        run: make sweep-bram
+
+      - name: skid_buffer sweep
+        run: make sweep-skid
+
+      - name: gemm_tile sweep
+        run: make sweep-gemm
 
       - name: Upload results
         if: always()
