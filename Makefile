@@ -16,6 +16,8 @@ N          ?= 8
 K_WIDTH     ?= 16
 MEM_LATENCY ?= 1
 ALLOW_K0    ?= 0
+ADDR_WIDTH   ?= 10
+READ_LATENCY ?= 1
 SEED ?=
 export SEED
 export K
@@ -80,9 +82,37 @@ COMPILE_ARGS += -Prequant.TAG_WIDTH=$(TAG_WIDTH)
 SIM_BUILD = sim_build/requant_acc_$(ACC_WIDTH)_bias_$(BIAS_WIDTH)_sat_$(SAT_WIDTH)_m_$(M_WIDTH)_sh_$(SHIFT_WIDTH)_dw_$(DATA_WIDTH)_tag_$(TAG_WIDTH)
 endif
 
+ifeq ($(MODULE_NAME),bram)
+COMPILE_ARGS += -Pbram.DATA_WIDTH=$(DATA_WIDTH)
+COMPILE_ARGS += -Pbram.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pbram.READ_LATENCY=$(READ_LATENCY)
+SIM_BUILD = sim_build/bram_dw_$(DATA_WIDTH)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
+endif
+
+ifeq ($(MODULE_NAME),skid_buffer)
+COMPILE_ARGS += -Pskid_buffer.DATA_WIDTH=$(DATA_WIDTH)
+SIM_BUILD = sim_build/skid_dw_$(DATA_WIDTH)
+endif
+
+ifeq ($(MODULE_NAME),gemm_tile)
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv
+VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv $(PWD)/axis/rtl/skid_buffer.sv
+COMPILE_ARGS += -Pgemm_tile.N=$(N)
+COMPILE_ARGS += -Pgemm_tile.DATA_WIDTH=$(DATA_WIDTH)
+COMPILE_ARGS += -Pgemm_tile.ACC_WIDTH=$(ACC_WIDTH)
+COMPILE_ARGS += -Pgemm_tile.K_WIDTH=$(K_WIDTH)
+COMPILE_ARGS += -Pgemm_tile.READ_LATENCY=$(READ_LATENCY)
+ifeq ($(ALLOW_K0),1)
+PLUSARGS += +ctrl_fsm_allow_k0
+endif
+SIM_BUILD = sim_build/gemm_n_$(N)_k_$(K)_rl_$(READ_LATENCY)
+endif
+
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -144,4 +174,39 @@ sweep-requant:
 	@$(MAKE) -s MODULE_NAME=requant TAG_WIDTH=1 || exit 1
 	@echo "=== requant sweep passed ==="
 
-sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant
+sweep-bram:
+	@for dw in 8 53 64; do \
+	  for aw in 2 4 10; do \
+	    for rl in 1 2; do \
+	      echo "=== DATA_WIDTH=$$dw ADDR_WIDTH=$$aw READ_LATENCY=$$rl ==="; \
+	      $(MAKE) -s MODULE_NAME=bram DATA_WIDTH=$$dw ADDR_WIDTH=$$aw READ_LATENCY=$$rl || exit 1; \
+	    done; \
+	  done; \
+	done
+	@echo "=== bram sweep passed ==="
+
+sweep-skid:
+	@for dw in 1 8 67; do \
+	  echo "=== DATA_WIDTH=$$dw ==="; \
+	  $(MAKE) -s MODULE_NAME=skid_buffer DATA_WIDTH=$$dw || exit 1; \
+	done
+	@echo "=== skid_buffer sweep passed ==="
+
+sweep-gemm:
+	@for n in 2 4 8; do \
+	  for k in 1 16 100; do \
+	    for rl in 1 2; do \
+	      echo "=== N=$$n K=$$k READ_LATENCY=$$rl ==="; \
+	      $(MAKE) -s MODULE_NAME=gemm_tile N=$$n K=$$k READ_LATENCY=$$rl || exit 1; \
+	    done; \
+	  done; \
+	done
+	@for rl in 1 2; do \
+	  echo "=== N=1 K=16 READ_LATENCY=$$rl ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=1 K=16 READ_LATENCY=$$rl || exit 1; \
+	  echo "=== N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 (k_in == 0 start) ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 || exit 1; \
+	done
+	@echo "=== gemm_tile sweep passed ==="
+
+sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm
