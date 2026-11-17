@@ -2,27 +2,35 @@
 //
 //   C[r][c] = requant(sum_k A[r][k] * B[k][c] + bias[c])     r, c = 0 .. N-1
 //
-// ctrl_fsm sequences the tile. operands come out of two block RAMs, go through
-// systolic_array, and each drained row goes through N requant instances (one
-// per column, so one per output channel) and a skid buffer.
+// ctrl_fsm sequences the tile. the B operands (weights) and the per-channel
+// parameters come out of block RAMs, the A operands (activations) come in on
+// a port from a feeder, and each drained row goes through N requant instances
+// (one per column, so one per output channel) and a skid buffer.
 //
-// nothing about the layer is fixed here. operands and the per-channel
-// parameters are written into memory at runtime and K, the base addresses,
-// zero point and ReLU come with each start.
+// nothing about the layer is fixed here. weights and parameters are written
+// into memory at runtime and K, the base addresses, zero point and ReLU come
+// with each start.
 //
-// memory layout, all written through the *_we ports (never stalled or reset):
-//   A  word a_base + k : column k of A. byte r is A[r][k].
-//   B  word b_base + k : row k of B.    byte c is B[k][c].
+// memory layout, written through the *_we ports (never stalled or reset):
+//   B  word b_base + k : row k of B. byte c is B[k][c].
 //   P  word p_base + c : {shift, mult, bias} for output channel c.
 //   a word must not be written on the same edge it is read (see bram.sv), so
 //   load a tile's words before starting it.
 //
+// A operand port: the feeder supplies the tile's K slices in order, k = 0 up.
+//   a_valid : the next slice is on a_data. must come from a register.
+//   a_data  : column k of A. byte r is A[r][k].
+//   a_take  : the slice is consumed on this edge; show the next one after it.
+//   a_valid may be high early or go low between slices. whenever the array
+//   needs a slice that is not there, the whole tile stalls (stall_feed).
+//
 // tile command: start/ready is the ctrl_fsm handshake. on the accepting edge
-//   k_in, a_base, b_base, p_base, zero_point and relu_en are latched, so they
-//   only need to be valid with start. a start with k_in == 0 is ignored.
-//   ready returns as soon as the array is free, which is before the last rows
-//   have left requant; that is safe because requant carries its parameters
-//   down the pipeline with the data.
+//   k_in, b_base, p_base, zero_point and relu_en are latched, so they only
+//   need to be valid with start. a start with k_in == 0 or k_in > K_MAX is
+//   ignored and raises err_k for one cycle. ready returns as soon as the
+//   array is free, which is before the last rows have left requant; that is
+//   safe because requant carries its parameters down the pipeline with the
+//   data.
 //
 // output stream: one beat per row, rows N-1 down to 0.
 //   m_axis_tdata : N requantized bytes, byte c is C[row][c]
@@ -31,14 +39,14 @@
 //
 // stall: stall = stall_out | stall_feed. stall_out is the skid buffer's
 //   registered "full", so m_axis_tready only reaches the skid buffer's own
-//   flops. stall_feed is the slot for a feeder-not-ready source and is tied
-//   low for now. stall freezes ctrl_fsm, the array, all three memory read
-//   paths, the parameter loader and the requants. a requant output is handed
-//   to the skid buffer only on an unstalled cycle, so it moves exactly once
-//   whichever source raised the stall.
+//   flops. stall_feed is high when the array is due a slice and a_valid is
+//   low; both of those are registers too. stall freezes ctrl_fsm, the array,
+//   both memory read paths, the parameter loader and the requants. a requant
+//   output is handed to the skid buffer only on an unstalled cycle, so it
+//   moves exactly once whichever source raised the stall.
 //
-// latency with m_axis_tready high, in edges after the one that accepts start
-// (L = READ_LATENCY), measured in simulation:
+// latency with m_axis_tready high and a_valid never late, in edges after the
+// one that accepts start (L = READ_LATENCY), measured in simulation:
 //   first beat valid on m_axis : L + K + 2N + 5
 //   last beat valid on m_axis  : L + K + 3N + 4
 //   ready rises again          : L + K + 3N + 1, so a tile takes L + K + 3N + 2
@@ -52,10 +60,10 @@ module gemm_tile #(
     parameter int N            = 8,
     parameter int DATA_WIDTH   = 8,
     parameter int ACC_WIDTH    = 32,
-    parameter int K_WIDTH      = 16,
+    parameter int K_MAX        = 1024, // deepest tile the operand buffers hold
+    parameter int K_WIDTH      = 11,   // has to hold K_MAX itself
     parameter int READ_LATENCY = 1,    // 1 or 2, also ctrl_fsm's MEM_LATENCY
-    parameter int A_ADDR_W     = 10,
-    parameter int B_ADDR_W     = 10,
+    parameter int B_ADDR_W     = 13,
     parameter int P_ADDR_W     = 6,
     parameter int BIAS_WIDTH   = 32,
     parameter int SAT_WIDTH    = 32,
@@ -71,18 +79,20 @@ module gemm_tile #(
     // tile command
     input  logic start,
     input  logic [K_WIDTH-1:0] k_in,
-    input  logic [A_ADDR_W-1:0] a_base,
     input  logic [B_ADDR_W-1:0] b_base,
     input  logic [P_ADDR_W-1:0] p_base,
     input  logic signed [DATA_WIDTH-1:0] zero_point,
     input  logic relu_en,
     output logic ready,
     output logic busy,
+    output logic err_k,
+
+    // A operand feeder
+    input  logic a_valid,
+    input  logic [N*DATA_WIDTH-1:0] a_data,
+    output logic a_take,
 
     // memory write ports
-    input  logic a_we,
-    input  logic [A_ADDR_W-1:0] a_waddr,
-    input  logic [N*DATA_WIDTH-1:0] a_wdata,
     input  logic b_we,
     input  logic [B_ADDR_W-1:0] b_waddr,
     input  logic [N*DATA_WIDTH-1:0] b_wdata,
@@ -106,6 +116,8 @@ module gemm_tile #(
             $fatal(1, "gemm_tile: N must be >= 1 (got %0d)", N);
         if (READ_LATENCY != 1 && READ_LATENCY != 2)
             $fatal(1, "gemm_tile: READ_LATENCY must be 1 or 2 (got %0d)", READ_LATENCY);
+        if (K_MAX < 1 || K_MAX >= (1 << K_WIDTH))
+            $fatal(1, "gemm_tile: K_MAX=%0d does not fit K_WIDTH=%0d", K_MAX, K_WIDTH);
         if ((1 << P_ADDR_W) < N)
             $fatal(1, "gemm_tile: parameter memory holds %0d words, a tile needs N=%0d",
                    1 << P_ADDR_W, N);
@@ -116,12 +128,19 @@ module gemm_tile #(
     // stall, an OR of sources
     logic stall;
     logic stall_out;     // output skid buffer is full
-    logic stall_feed;    // a feeder cannot supply operands (none can yet)
+    logic stall_feed;    // the array is due a slice the feeder has not got
     logic skid_s_ready;
+    logic a_need;
 
     assign stall_out  = ~skid_s_ready;
-    assign stall_feed = 1'b0;
+    assign stall_feed = a_need & ~a_valid;
     assign stall      = stall_out | stall_feed;
+    assign a_take     = a_need & ~stall;
+
+    // a tile deeper than the operand buffers would read past its own words.
+    // ctrl_fsm never sees that start; it drops k_in == 0 by itself.
+    logic k_ok;
+    assign k_ok = (k_in <= K_WIDTH'(K_MAX));
 
     // tile sequencer
     logic accept;
@@ -139,7 +158,7 @@ module gemm_tile #(
     ) u_ctrl (
         .clk             (clk),
         .reset           (reset),
-        .start           (start),
+        .start           (start & k_ok),
         .k_in            (k_in),
         .ready           (ready),
         .busy            (busy),
@@ -157,10 +176,25 @@ module gemm_tile #(
 
     // same condition ctrl_fsm uses to take the tile, so the latches below can
     // never disagree with it about whether a tile started
-    assign accept = start & ready & (k_in != '0);
+    assign accept = start & ready & k_ok & (k_in != '0);
+
+    // a_need marks the cycle the B word for a slice reaches the array, which
+    // is the cycle the A slice has to be there too. it is op_req seen through
+    // the same delay as the memory, frozen by the same stall.
+    delay #(.DATA_WIDTH(1), .DEPTH(READ_LATENCY)) u_need_dly (
+        .clk      (clk),
+        .reset    (reset),
+        .en       (~stall),
+        .in_data  (op_req),
+        .out_data (a_need)
+    );
+
+    always_ff @(posedge clk) begin
+        if (reset) err_k <= 1'b0;
+        else       err_k <= start & ready & ~(k_ok & (k_in != '0));
+    end
 
     // per-tile command latches and the parameter loader
-    logic [A_ADDR_W-1:0] a_base_q;
     logic [B_ADDR_W-1:0] b_base_q;
     logic [P_ADDR_W-1:0] p_base_q;
     logic signed [DATA_WIDTH-1:0] zp_q;
@@ -191,7 +225,6 @@ module gemm_tile #(
 
     always_ff @(posedge clk) begin
         if (reset) begin
-            a_base_q <= '0;
             b_base_q <= '0;
             p_base_q <= '0;
             zp_q     <= '0;
@@ -204,7 +237,6 @@ module gemm_tile #(
             p_loaded <= '0;
         end else if (!stall) begin
             if (accept) begin
-                a_base_q <= a_base;
                 b_base_q <= b_base;
                 p_base_q <= p_base;
                 zp_q     <= zero_point;
@@ -228,21 +260,7 @@ module gemm_tile #(
 
     // memories. the read enable is ~stall so the words in flight hold with
     // the array they are headed for.
-    logic [N*DATA_WIDTH-1:0] a_rdata, b_rdata;
-
-    bram #(
-        .DATA_WIDTH   (N*DATA_WIDTH),
-        .ADDR_WIDTH   (A_ADDR_W),
-        .READ_LATENCY (READ_LATENCY)
-    ) u_a_mem (
-        .clk   (clk),
-        .we    (a_we),
-        .waddr (a_waddr),
-        .wdata (a_wdata),
-        .re    (~stall),
-        .raddr (a_base_q + A_ADDR_W'(k_idx)),
-        .rdata (a_rdata)
-    );
+    logic [N*DATA_WIDTH-1:0] b_rdata;
 
     bram #(
         .DATA_WIDTH   (N*DATA_WIDTH),
@@ -283,7 +301,7 @@ module gemm_tile #(
         .clk         (clk),
         .reset       (reset),
         .en          (arr_en),
-        .a_in        (a_rdata),
+        .a_in        (a_data),
         .b_in        (b_rdata),
         .first_in    (arr_first),
         .last_in     (arr_last),
@@ -348,6 +366,9 @@ module gemm_tile #(
     always @(posedge clk) begin
         if (!reset && !stall && c_valid && !(&p_loaded))
             $fatal(1, "gemm_tile: a row reached requant before all parameters were loaded");
+        // +gemm_tile_allow_bad_k lets the testbench prove such a start is ignored
+        if (!reset && start && ready && !k_ok && !$test$plusargs("gemm_tile_allow_bad_k"))
+            $fatal(1, "gemm_tile: k_in=%0d exceeds K_MAX=%0d", k_in, K_MAX);
     end
 `endif
 

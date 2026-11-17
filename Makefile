@@ -18,6 +18,7 @@ MEM_LATENCY ?= 1
 ALLOW_K0    ?= 0
 ADDR_WIDTH   ?= 10
 READ_LATENCY ?= 1
+B_ADDR_W     ?= 13
 SEED ?=
 export SEED
 export K
@@ -102,12 +103,13 @@ VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv $(PWD)/axis/rtl/skid_buffer.sv
 COMPILE_ARGS += -Pgemm_tile.N=$(N)
 COMPILE_ARGS += -Pgemm_tile.DATA_WIDTH=$(DATA_WIDTH)
 COMPILE_ARGS += -Pgemm_tile.ACC_WIDTH=$(ACC_WIDTH)
-COMPILE_ARGS += -Pgemm_tile.K_WIDTH=$(K_WIDTH)
 COMPILE_ARGS += -Pgemm_tile.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pgemm_tile.B_ADDR_W=$(B_ADDR_W)
+# the bad-K test needs both simulation-only $$fatal checks switched off
 ifeq ($(ALLOW_K0),1)
-PLUSARGS += +ctrl_fsm_allow_k0
+PLUSARGS += +ctrl_fsm_allow_k0 +gemm_tile_allow_bad_k
 endif
-SIM_BUILD = sim_build/gemm_n_$(N)_k_$(K)_rl_$(READ_LATENCY)
+SIM_BUILD = sim_build/gemm_n_$(N)_k_$(K)_rl_$(READ_LATENCY)_ba_$(B_ADDR_W)
 endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
@@ -197,15 +199,17 @@ sweep-gemm:
 	  for k in 1 16 100; do \
 	    for rl in 1 2; do \
 	      echo "=== N=$$n K=$$k READ_LATENCY=$$rl ==="; \
-	      $(MAKE) -s MODULE_NAME=gemm_tile N=$$n K=$$k READ_LATENCY=$$rl || exit 1; \
+	      $(MAKE) -s MODULE_NAME=gemm_tile N=$$n K=$$k READ_LATENCY=$$rl B_ADDR_W=10 || exit 1; \
 	    done; \
 	  done; \
 	done
 	@for rl in 1 2; do \
 	  echo "=== N=1 K=16 READ_LATENCY=$$rl ==="; \
-	  $(MAKE) -s MODULE_NAME=gemm_tile N=1 K=16 READ_LATENCY=$$rl || exit 1; \
-	  echo "=== N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 (k_in == 0 start) ==="; \
-	  $(MAKE) -s MODULE_NAME=gemm_tile N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 || exit 1; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=1 K=16 READ_LATENCY=$$rl B_ADDR_W=10 || exit 1; \
+	  echo "=== N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 (bad k_in starts) ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=4 K=5 READ_LATENCY=$$rl B_ADDR_W=10 ALLOW_K0=1 || exit 1; \
+	  echo "=== N=8 K=576 READ_LATENCY=$$rl B_ADDR_W=13 (full-size weight memory, K = K_MAX test) ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=8 K=576 READ_LATENCY=$$rl B_ADDR_W=13 || exit 1; \
 	done
 	@echo "=== gemm_tile sweep passed ==="
 
