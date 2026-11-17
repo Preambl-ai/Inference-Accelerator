@@ -18,6 +18,7 @@ MEM_LATENCY ?= 1
 ALLOW_K0    ?= 0
 ADDR_WIDTH   ?= 10
 READ_LATENCY ?= 1
+B_ADDR_W     ?= 13
 SEED ?=
 export SEED
 export K
@@ -102,17 +103,27 @@ VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv $(PWD)/axis/rtl/skid_buffer.sv
 COMPILE_ARGS += -Pgemm_tile.N=$(N)
 COMPILE_ARGS += -Pgemm_tile.DATA_WIDTH=$(DATA_WIDTH)
 COMPILE_ARGS += -Pgemm_tile.ACC_WIDTH=$(ACC_WIDTH)
-COMPILE_ARGS += -Pgemm_tile.K_WIDTH=$(K_WIDTH)
 COMPILE_ARGS += -Pgemm_tile.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pgemm_tile.B_ADDR_W=$(B_ADDR_W)
+# the bad-K test needs both simulation-only $$fatal checks switched off
 ifeq ($(ALLOW_K0),1)
-PLUSARGS += +ctrl_fsm_allow_k0
+PLUSARGS += +ctrl_fsm_allow_k0 +gemm_tile_allow_bad_k
 endif
-SIM_BUILD = sim_build/gemm_n_$(N)_k_$(K)_rl_$(READ_LATENCY)
+SIM_BUILD = sim_build/gemm_n_$(N)_k_$(K)_rl_$(READ_LATENCY)_ba_$(B_ADDR_W)
+endif
+
+ifeq ($(MODULE_NAME),im2col_reader)
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/delay.sv
+COMPILE_ARGS += -Pim2col_reader.N=$(N)
+COMPILE_ARGS += -Pim2col_reader.DATA_WIDTH=$(DATA_WIDTH)
+COMPILE_ARGS += -Pim2col_reader.ADDR_W=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pim2col_reader.READ_LATENCY=$(READ_LATENCY)
+SIM_BUILD = sim_build/im2col_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
 endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -197,16 +208,31 @@ sweep-gemm:
 	  for k in 1 16 100; do \
 	    for rl in 1 2; do \
 	      echo "=== N=$$n K=$$k READ_LATENCY=$$rl ==="; \
-	      $(MAKE) -s MODULE_NAME=gemm_tile N=$$n K=$$k READ_LATENCY=$$rl || exit 1; \
+	      $(MAKE) -s MODULE_NAME=gemm_tile N=$$n K=$$k READ_LATENCY=$$rl B_ADDR_W=10 || exit 1; \
 	    done; \
 	  done; \
 	done
 	@for rl in 1 2; do \
 	  echo "=== N=1 K=16 READ_LATENCY=$$rl ==="; \
-	  $(MAKE) -s MODULE_NAME=gemm_tile N=1 K=16 READ_LATENCY=$$rl || exit 1; \
-	  echo "=== N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 (k_in == 0 start) ==="; \
-	  $(MAKE) -s MODULE_NAME=gemm_tile N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 || exit 1; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=1 K=16 READ_LATENCY=$$rl B_ADDR_W=10 || exit 1; \
+	  echo "=== N=4 K=5 READ_LATENCY=$$rl ALLOW_K0=1 (bad k_in starts) ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=4 K=5 READ_LATENCY=$$rl B_ADDR_W=10 ALLOW_K0=1 || exit 1; \
+	  echo "=== N=8 K=576 READ_LATENCY=$$rl B_ADDR_W=13 (full-size weight memory, K = K_MAX test) ==="; \
+	  $(MAKE) -s MODULE_NAME=gemm_tile N=8 K=576 READ_LATENCY=$$rl B_ADDR_W=13 || exit 1; \
 	done
 	@echo "=== gemm_tile sweep passed ==="
 
-sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm
+sweep-im2col:
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=im2col_reader N=$$n READ_LATENCY=$$rl ADDR_WIDTH=12 || exit 1; \
+	  done; \
+	done
+	@for rl in 1 2; do \
+	  echo "=== N=8 READ_LATENCY=$$rl ADDR_WIDTH=22 (large images) ==="; \
+	  $(MAKE) -s MODULE_NAME=im2col_reader N=8 READ_LATENCY=$$rl ADDR_WIDTH=22 || exit 1; \
+	done
+	@echo "=== im2col_reader sweep passed ==="
+
+sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col

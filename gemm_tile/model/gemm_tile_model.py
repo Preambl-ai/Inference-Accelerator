@@ -58,9 +58,9 @@ class GemmTileModel:
     SKID_LATENCY = 1
 
     def __init__(self, n: int = 8, data_width: int = 8, acc_width: int = 32,
-                 read_latency: int = 1, a_addr_w: int = 10, b_addr_w: int = 10,
+                 read_latency: int = 1, b_addr_w: int = 13,
                  p_addr_w: int = 6, bias_width: int = 32, sat_width: int = 32,
-                 m_width: int = 16, shift_width: int = 5):
+                 m_width: int = 16, shift_width: int = 5, k_max: int = 1024):
         if read_latency not in (1, 2):
             raise ValueError(f"READ_LATENCY must be 1 or 2 (got {read_latency})")
         if (1 << p_addr_w) < n:
@@ -69,14 +69,13 @@ class GemmTileModel:
         self.data_width = data_width
         self.acc_width = acc_width
         self.read_latency = read_latency
-        self.a_addr_w = a_addr_w
+        self.k_max = k_max
         self.b_addr_w = b_addr_w
         self.p_addr_w = p_addr_w
         self.bias_width = bias_width
         self.sat_width = sat_width
         self.m_width = m_width
         self.shift_width = shift_width
-        self.a_mem = {}     # addr -> N values, index r
         self.b_mem = {}     # addr -> N values, index c
         self.p_mem = {}     # addr -> (bias, mult, shift)
 
@@ -112,10 +111,6 @@ class GemmTileModel:
 
     # memory images
 
-    def write_a(self, addr: int, column) -> None:
-        self.pack_bytes(column)
-        self.a_mem[addr % (1 << self.a_addr_w)] = list(column)
-
     def write_b(self, addr: int, row) -> None:
         self.pack_bytes(row)
         self.b_mem[addr % (1 << self.b_addr_w)] = list(row)
@@ -124,11 +119,9 @@ class GemmTileModel:
         self.pack_param(bias, mult, shift)
         self.p_mem[addr % (1 << self.p_addr_w)] = (bias, mult, shift)
 
-    def load_tile(self, a, b, params, a_base: int, b_base: int, p_base: int) -> None:
-        """a: N x K, b: K x N, params: N tuples of (bias, mult, shift)."""
-        k = len(b)
-        for j in range(k):
-            self.write_a(a_base + j, [a[r][j] for r in range(self.n)])
+    def load_tile(self, b, params, b_base: int, p_base: int) -> None:
+        """b: K x N, params: N tuples of (bias, mult, shift)."""
+        for j in range(len(b)):
             self.write_b(b_base + j, list(b[j]))
         for c in range(self.n):
             self.write_p(p_base + c, *params[c])
@@ -143,10 +136,17 @@ class GemmTileModel:
         return [self._word(self.p_mem, p_base + c, self.p_addr_w, "P")
                 for c in range(self.n)]
 
-    def run_tile(self, k: int, a_base: int, b_base: int, p_base: int,
+    def run_tile(self, slices, b_base: int, p_base: int,
                  zero_point: int, relu_en: int) -> List[Beat]:
-        """The beats one tile puts on the stream, in order."""
-        cols = [self._word(self.a_mem, a_base + j, self.a_addr_w, "A") for j in range(k)]
+        """The beats one tile puts on the stream, in order. slices is what the
+        feeder supplies on the A port: K lists of N values, slice k holding
+        column k of A."""
+        k = len(slices)
+        if not 1 <= k <= self.k_max:
+            raise ValueError(f"K={k} outside 1 .. K_MAX={self.k_max}; the RTL ignores that start")
+        cols = [list(sl) for sl in slices]
+        for sl in cols:
+            self.pack_bytes(sl)
         rows = [self._word(self.b_mem, b_base + j, self.b_addr_w, "B") for j in range(k)]
         a = np.array(cols, dtype=np.int64).T       # N x K
         b = np.array(rows, dtype=np.int64)         # K x N
@@ -229,14 +229,15 @@ if __name__ == "__main__":
 
     # the memory layout and beat order
     m = GemmTileModel(n=2, read_latency=2)
-    m.load_tile(a, b, [(1, 1, 1), (-50, 3, 2)], a_base=7, b_base=900, p_base=62)
-    chk("A word is a column", m.a_mem[8], [2, 4])
+    m.load_tile(b, [(1, 1, 1), (-50, 3, 2)], b_base=900, p_base=62)
+    slices = [[a[r][j] for r in range(2)] for j in range(2)]
+    chk("an A slice is a column", slices[1], [2, 4])
     chk("B word is a row", m.b_mem[901], [7, 8])
     chk("P address wraps at the memory size", sorted(m.p_mem), [62, 63])
     chk("byte packing", m.pack_bytes([-1, 2]), 0x02FF)
     chk("byte unpacking", m.unpack_bytes(0x02FF), [-1, 2])
     chk("param packing", m.pack_param(-1, 3, 2), (2 << 48) | (3 << 32) | 0xFFFFFFFF)
-    beats = m.run_tile(2, 7, 900, 62, zero_point=5, relu_en=0)
+    beats = m.run_tile(slices, 900, 62, zero_point=5, relu_en=0)
     chk("beats: row N-1 first, last on row 0",
         beats, [Beat([27, 5], 1, 0), Beat([15, -16], 0, 1)])
 
@@ -244,10 +245,16 @@ if __name__ == "__main__":
     chk("latency: tile period N=8 K=72 L=1", GemmTileModel(n=8).tile_period(72), 99)
 
     try:
-        m.run_tile(3, 7, 900, 62, 0, 0)
+        m.run_tile(slices + [[0, 0]], 900, 62, 0, 0)
         chk("reading an unwritten word is an error", "no error", "KeyError")
     except KeyError:
         chk("reading an unwritten word is an error", "KeyError", "KeyError")
+
+    try:
+        GemmTileModel(n=2, k_max=4).run_tile([[0, 0]] * 5, 900, 62, 0, 0)
+        chk("K > K_MAX is rejected", "no error", "ValueError")
+    except ValueError:
+        chk("K > K_MAX is rejected", "ValueError", "ValueError")
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
 

@@ -20,6 +20,28 @@ def read_int(sig, name):
     return int(sig.value)
 
 
+def feed_pattern(rng, kind, n):
+    """Endless a_valid generator: is the feeder willing to show a slice?"""
+    while True:
+        if kind == "always":
+            yield 1
+        elif kind == "random":
+            yield int(rng.random() < 0.5)
+        elif kind == "rare":
+            yield int(rng.random() < 0.1)
+        elif kind == "toggle":
+            yield 1
+            yield 0
+        elif kind == "gather":
+            # the shape a serial reader has: N slices, then a gap to refill
+            for _ in range(n):
+                yield 1
+            for _ in range(n + 3):
+                yield 0
+        else:
+            raise ValueError(kind)
+
+
 def ready_pattern(rng, kind):
     """Endless m_axis_tready generator for one backpressure style."""
     while True:
@@ -49,9 +71,9 @@ def ready_pattern(rng, kind):
 class Tile:
     """One tile's command and the beats it has to produce."""
 
-    def __init__(self, k, a_base, b_base, p_base, zero_point, relu_en, beats, params):
+    def __init__(self, k, b_base, p_base, zero_point, relu_en, beats, params, slices):
         self.k = k
-        self.a_base = a_base
+        self.slices = slices    # what the feeder supplies: K lists of N values
         self.b_base = b_base
         self.p_base = p_base
         self.zero_point = zero_point
@@ -78,13 +100,14 @@ class GemmHarness:
         self.aw = g("ACC_WIDTH")
         self.kw = g("K_WIDTH")
         self.lat = g("READ_LATENCY")
-        self.a_aw, self.b_aw, self.p_aw = g("A_ADDR_W"), g("B_ADDR_W"), g("P_ADDR_W")
+        self.b_aw, self.p_aw = g("B_ADDR_W"), g("P_ADDR_W")
+        self.k_max = g("K_MAX")
         self.bw, self.sw = g("BIAS_WIDTH"), g("SAT_WIDTH")
         self.mw, self.shw = g("M_WIDTH"), g("SHIFT_WIDTH")
         self.row_w = g("ROW_W")
-        self.model = GemmTileModel(self.n, self.dw, self.aw, self.lat, self.a_aw,
+        self.model = GemmTileModel(self.n, self.dw, self.aw, self.lat,
                                    self.b_aw, self.p_aw, self.bw, self.sw,
-                                   self.mw, self.shw)
+                                   self.mw, self.shw, self.k_max)
         self.lo, self.hi = signed_range(self.dw)
         self.cycle = 0
         self.seed = int(os.environ.get("SEED") or random.randrange(2**31))
@@ -100,8 +123,14 @@ class GemmHarness:
         self.cover = dict(clamp_hi=0, clamp_lo=0, relu_floor=0, in_range=0)
         # where the next tile's words go. tiles are often loaded several at a
         # time before any of them runs, so they must not land on each other.
-        self.next_base = [self.rng.randrange(1 << w)
-                          for w in (self.a_aw, self.b_aw, self.p_aw)]
+        self.next_base = [self.rng.randrange(1 << w) for w in (self.b_aw, self.p_aw)]
+        # the A operand feeder: slices owed to the DUT, oldest first, and how
+        # willing it is to show the next one
+        self.feed = []
+        self.feed_gen = feed_pattern(self.rng, "always", self.n)
+        self.feed_hold = 0      # cycles to keep a_valid low regardless
+        self.feed_stall_cycles = 0
+        self.dup_risk_cycles = 0
 
     # lifecycle
 
@@ -110,8 +139,8 @@ class GemmHarness:
         d.reset.value = 1
         d.start.value = 0
         d.m_axis_tready.value = 0
-        for name in ("k_in", "a_base", "b_base", "p_base", "zero_point", "relu_en",
-                     "a_we", "a_waddr", "a_wdata", "b_we", "b_waddr", "b_wdata",
+        for name in ("k_in", "b_base", "p_base", "zero_point", "relu_en",
+                     "a_valid", "a_data", "b_we", "b_waddr", "b_wdata",
                      "p_we", "p_waddr", "p_wdata"):
             getattr(d, name).value = 0
         cocotb.start_soon(Clock(d.clk, 10, unit="ns").start())
@@ -134,15 +163,13 @@ class GemmHarness:
             await self.fill_memories()
 
     async def fill_memories(self):
-        """Put nonzero garbage in every word of all three memories, so an
+        """Put nonzero garbage in every word of both memories, so an
         address or timing error reads something wrong rather than a zero that
         would vanish in the sum."""
         r = self.rng
         byte = lambda: r.choice((-1, 1)) * r.randint(1, self.hi)
-        for addr in range(1 << max(self.a_aw, self.b_aw, self.p_aw)):
+        for addr in range(1 << max(self.b_aw, self.p_aw)):
             w = {}
-            if addr < (1 << self.a_aw):
-                w["a"] = (addr, [byte() for _ in range(self.n)])
             if addr < (1 << self.b_aw):
                 w["b"] = (addr, [byte() for _ in range(self.n)])
             if addr < (1 << self.p_aw):
@@ -155,7 +182,7 @@ class GemmHarness:
     async def step(self, tile=None, tready=0, writes=None, reset=0, check=True):
         """Advance one rising edge.
 
-        tile, if given, is offered with start high. writes maps 'a'/'b'/'p' to
+        tile, if given, is offered with start high. writes maps 'b'/'p' to
         (addr, payload) and goes to the DUT and the model. Returns
         (accepted, beat) for the edge: whether start was taken and the beat
         that crossed m_axis, if any.
@@ -169,7 +196,6 @@ class GemmHarness:
         if tile is not None:
             d.start.value = 1
             d.k_in.value = tile.k
-            d.a_base.value = tile.a_base
             d.b_base.value = tile.b_base
             d.p_base.value = tile.p_base
             d.zero_point.value = tile.zero_point & ((1 << self.dw) - 1)
@@ -178,13 +204,23 @@ class GemmHarness:
             # with start low the command pins carry garbage that must be ignored
             d.start.value = 0
             d.k_in.value = r.randint(1, (1 << self.kw) - 1)
-            d.a_base.value = r.randrange(1 << self.a_aw)
             d.b_base.value = r.randrange(1 << self.b_aw)
             d.p_base.value = r.randrange(1 << self.p_aw)
             d.zero_point.value = r.randrange(1 << self.dw)
             d.relu_en.value = r.randint(0, 1)
 
-        for mem in ("a", "b", "p"):
+        # the feeder behaves like a register: what it shows can only change
+        # between cycles, and it shows garbage when it has nothing valid
+        if self.feed_hold:
+            self.feed_hold -= 1
+            a_valid = 0
+        else:
+            a_valid = int(bool(self.feed) and not reset and next(self.feed_gen))
+        d.a_valid.value = a_valid
+        d.a_data.value = (self.model.pack_bytes(self.feed[0]) if a_valid
+                          else r.getrandbits(self.n * self.dw) | 1)
+
+        for mem in ("b", "p"):
             we = getattr(d, f"{mem}_we")
             if mem in writes:
                 addr, payload = writes[mem]
@@ -194,8 +230,8 @@ class GemmHarness:
                     getattr(d, "p_wdata").value = self.model.pack_param(*payload)
                     self.model.write_p(addr, *payload)
                 else:
-                    getattr(d, f"{mem}_wdata").value = self.model.pack_bytes(payload)
-                    (self.model.write_a if mem == "a" else self.model.write_b)(addr, payload)
+                    d.b_wdata.value = self.model.pack_bytes(payload)
+                    self.model.write_b(addr, payload)
             else:
                 we.value = 0
 
@@ -204,21 +240,47 @@ class GemmHarness:
             # every output is a function of registers only, so what is on the
             # pins now is what the neighbours sample at the coming edge
             await ReadOnly()
+            self._was_ready = bool(read_int(d.ready, "ready"))
             if reset:
                 self.expected, self.running, self.blocked = [], [], None
+                self.feed = []
             else:
-                accepted = bool(tile is not None and read_int(d.ready, "ready"))
+                # the DUT ignores a start whose K it cannot run
+                accepted = bool(tile is not None and 1 <= tile.k <= self.k_max
+                                and read_int(d.ready, "ready"))
                 beat = self._watch_stream(tready)
                 self._watch_first_row()
-                self.stall_cycles += read_int(d.stall, "stall")
+                stall = read_int(d.stall, "stall")
+                stall_feed = read_int(d.stall_feed, "stall_feed")
+                self.stall_cycles += stall
+                self.feed_stall_cycles += stall_feed
+                # the case the ~stall on the skid buffer input exists for: a
+                # row waiting at the requant output, room in the skid buffer,
+                # and the tile frozen by the feeder
+                self.dup_risk_cycles += int(stall_feed and not read_int(d.stall_out, "stall_out")
+                                            and read_int(d.rq_valid, "rq_valid") & 1)
+                if read_int(d.a_take, "a_take"):
+                    assert a_valid, (
+                        f"cycle {self.cycle}: a_take with a_valid low, seed={self.seed}"
+                    )
+                    self.feed.pop(0)
                 if accepted:
                     self.accepts += 1
                     self.running.append(tile)
                     self.expected += tile.beats
+                    self.feed += tile.slices
 
         await RisingEdge(d.clk)
         # leave the caller at the settled values of the new cycle
         await ReadOnly()
+        if check:
+            # err_k is a one-cycle pulse for exactly the starts that were refused
+            refused = bool(tile is not None and not reset and not accepted
+                           and not 1 <= tile.k <= self.k_max and self._was_ready)
+            assert read_int(d.err_k, "err_k") == int(refused), (
+                f"cycle {self.cycle}: err_k={read_int(d.err_k, 'err_k')}, "
+                f"expected {int(refused)}, seed={self.seed}"
+            )
         self.cycle += 1
         return accepted, beat
 
@@ -349,8 +411,7 @@ class GemmHarness:
         random starting point, with a random gap, so consecutive tiles never
         overlap and a tile regularly wraps past the top of a memory."""
         bases = tuple(self.next_base)
-        for i, (words, width) in enumerate(((k, self.a_aw), (k, self.b_aw),
-                                            (self.n, self.p_aw))):
+        for i, (words, width) in enumerate(((k, self.b_aw), (self.n, self.p_aw))):
             gap = self.rng.randint(0, 3) if words * 8 <= (1 << width) else 0
             self.next_base[i] = (self.next_base[i] + words + gap) % (1 << width)
         return bases
@@ -360,9 +421,9 @@ class GemmHarness:
         """Decide a tile's contents. Returns the Tile and its memory writes;
         the beats are filled in by load(), once the model has the data."""
         r = self.rng
-        if k >= (1 << self.kw) or k > (1 << min(self.a_aw, self.b_aw)):
+        if k > self.k_max or k > (1 << self.b_aw):
             raise ValueError(f"K={k} does not fit this configuration")
-        a_base, b_base, p_base = bases or self.random_bases(k)
+        b_base, p_base = bases or self.random_bases(k)
         a = a or [[r.randint(self.lo, self.hi) for _ in range(k)] for _ in range(self.n)]
         b = b or [[r.randint(self.lo, self.hi) for _ in range(self.n)] for _ in range(k)]
         zp = r.randint(self.lo, self.hi) if zero_point is None else zero_point
@@ -375,17 +436,17 @@ class GemmHarness:
         for j in range(max(k, self.n)):
             w = {}
             if j < k:
-                w["a"] = ((a_base + j) % (1 << self.a_aw), [a[i][j] for i in range(self.n)])
                 w["b"] = ((b_base + j) % (1 << self.b_aw), list(b[j]))
             if j < self.n:
                 w["p"] = ((p_base + j) % (1 << self.p_aw), params[j])
             writes.append(w)
-        return Tile(k, a_base, b_base, p_base, zp, relu, None, params), writes
+        slices = [[a[i][j] for i in range(self.n)] for j in range(k)]
+        return Tile(k, b_base, p_base, zp, relu, None, params, slices), writes
 
     async def load(self, tile, writes, tready=0):
         for w in writes:
             await self.step(writes=w, tready=tready)
-        tile.beats = self.model.run_tile(tile.k, tile.a_base, tile.b_base, tile.p_base,
+        tile.beats = self.model.run_tile(tile.slices, tile.b_base, tile.p_base,
                                          tile.zero_point, tile.relu_en)
         return tile
 
@@ -393,13 +454,14 @@ class GemmHarness:
         tile, writes = self.make_tile(k, **kw)
         return await self.load(tile, writes)
 
-    async def run(self, tiles, ready_kind="always", hold_start=True, limit=None):
+    async def run(self, tiles, ready_kind="always", feed_kind="always", limit=None):
         """Run tiles one after another and wait for the last beat of the last
         one. Returns the number of cycles from the first accept."""
         ready = ready_pattern(self.rng, ready_kind)
+        self.feed_gen = feed_pattern(self.rng, feed_kind, self.n)
         queue = list(tiles)
         owed = self.received + len(self.expected) + sum(len(t.beats) for t in queue)
-        limit = limit or 400 * sum(t.k + 3 * self.n + 12 for t in tiles) + 2000
+        limit = limit or 600 * sum(t.k + 3 * self.n + 12 for t in tiles) + 2000
         first_accept = None
         for _ in range(limit):
             accepted, _ = await self.step(tile=queue[0] if queue else None,
@@ -567,14 +629,14 @@ async def test_back_to_back_tiles(dut):
     h = GemmHarness(dut)
     await h.start()
     k = get_k()
-    ks = [k, 1, min(k + 3, 1 << min(h.a_aw, h.b_aw)), 2, k]
+    ks = [k, 1, min(k + 3, h.k_max), 2, k]
     tiles = []
     for i, kk in enumerate(ks):
         # separate regions, so loading one cannot touch another
-        region = (1 << min(h.a_aw, h.b_aw)) // len(ks)
-        bases = (i * region, ((i + 2) % len(ks)) * region,
+        region = (1 << h.b_aw) // len(ks)
+        bases = (((i + 2) % len(ks)) * region,
                  (i * h.n) % (1 << h.p_aw) if (len(ks) * h.n) <= (1 << h.p_aw) else None)
-        if bases[2] is None or kk > region:
+        if bases[1] is None or kk > region:
             raise ValueError("memories too small for this test")
         tiles.append(await h.new_tile(kk, bases=bases))
     for kind in ("always", "random"):
@@ -606,9 +668,10 @@ async def test_reload_same_addresses(dut):
     await h.run([tile])
     params = h.random_params()
     for c in range(h.n):
-        await h.step(writes={"p": ((bases[2] + c) % (1 << h.p_aw), params[c])})
+        await h.step(writes={"p": ((bases[1] + c) % (1 << h.p_aw), params[c])})
     tile2 = Tile(k, *bases, tile.zero_point, tile.relu_en,
-                 h.model.run_tile(k, *bases, tile.zero_point, tile.relu_en), params)
+                 h.model.run_tile(tile.slices, *bases, tile.zero_point, tile.relu_en),
+                 params, tile.slices)
     await h.run([tile2])
 
 
@@ -720,38 +783,143 @@ async def test_tready_is_registered(dut):
     await h.step(reset=1)
 
 
-@cocotb.test(skip=os.environ.get("ALLOW_K0") != "1")
-async def test_k_zero_start_ignored(dut):
-    """A start with k_in == 0 must not disturb anything here either: the
-    command latches and the parameter loader use the same accept as ctrl_fsm.
+@cocotb.test()
+async def test_feeder_gaps(dut):
+    """The feeder is late in every style, against every output style. The
+    tile has to stall for it (stall_feed) and still deliver every beat once."""
+    h = GemmHarness(dut)
+    await h.start()
+    k = get_k()
+    # enough slices per run that a late feeder is certain to be caught out,
+    # however short the tiles are
+    n_tiles = max(2, -(-24 // k))
+    for feed in ("random", "rare", "toggle", "gather"):
+        before = h.feed_stall_cycles
+        for ready in ("always", "random", "long_low"):
+            # loaded in batches small enough that their parameter words fit
+            # the parameter memory side by side
+            left = n_tiles
+            while left:
+                batch = min(left, (1 << h.p_aw) // (h.n + 3))
+                tiles = [await h.new_tile(k) for _ in range(batch)]
+                await h.run(tiles, ready, feed)
+                left -= batch
+            await h.settle()
+        # judged over the three output styles together: with tready always
+        # high a regular feeder can stay in step with a regular tile period
+        assert h.feed_stall_cycles > before, (
+            f"feed={feed} never stalled the tile; the test did not cover stall_feed"
+        )
+    assert h.rows_checked == 12 * n_tiles * h.n
+    dut._log.info(f"{h.feed_stall_cycles} cycles stalled by the feeder, "
+                  f"{h.stall_cycles} stalled in total")
 
-    Needs +ctrl_fsm_allow_k0 (make ALLOW_K0=1) to switch off ctrl_fsm's
-    simulation-only $fatal.
+
+@cocotb.test()
+async def test_feeder_stall_with_row_at_requant_output(dut):
+    """Back-to-back tiles where the next tile's first slice is late. The last
+    rows of the previous tile are still coming out of requant at that moment,
+    so a row sits at the requant output with the skid buffer open while the
+    datapath is frozen by the feeder. It must be handed over exactly once."""
+    h = GemmHarness(dut)
+    await h.start()
+    k = get_k()
+    tiles = [await h.new_tile(k) for _ in range(6)]
+    queue = list(tiles)
+    owed = sum(len(t.beats) for t in tiles)
+    late = 0
+    for _ in range(40 * sum(t.k + 3 * h.n + 20 for t in tiles)):
+        accepted, _ = await h.step(tile=queue[0] if queue else None, tready=1)
+        if accepted:
+            queue.pop(0)
+            # a different lateness each tile, to sweep the overlap
+            late += 1
+            h.feed_hold = h.lat + late + 2
+        if not queue and h.received == owed:
+            break
+    assert h.received == owed and not h.expected
+    # the next tile's first slice is due READ_LATENCY + 1 cycles after its
+    # accept, and the previous tile's last row is at the requant output 2
+    # cycles after that accept. so the two only meet at READ_LATENCY = 1; at 2
+    # the row has always gone one cycle before the feeder can stall anything.
+    if h.lat == 1:
+        assert h.dup_risk_cycles > 0, (
+            "never had a valid requant output, an open skid buffer and a feeder "
+            "stall on the same cycle; the test did not reach the case it is for"
+        )
+    else:
+        assert h.dup_risk_cycles == 0, (
+            "a row was held at the requant output by stall_feed at READ_LATENCY=2; "
+            "the timing argument in this test is wrong"
+        )
+    dut._log.info(f"{h.dup_risk_cycles} cycles with a row held at the requant output by stall_feed")
+
+
+@cocotb.test()
+async def test_k_at_k_max(dut):
+    """The deepest tile the buffers hold. Only where it fits the weight memory
+    in this build; the sweep has a configuration for it."""
+    h = GemmHarness(dut)
+    await h.start(fill=False)
+    if h.k_max > (1 << h.b_aw):
+        dut._log.info(f"K_MAX={h.k_max} does not fit B_ADDR_W={h.b_aw} here; "
+                      f"covered by the B_ADDR_W=13 sweep point")
+        return
+    tile = await h.new_tile(h.k_max)
+    await h.run([tile], "random", "random")
+    dut._log.info(f"K = K_MAX = {h.k_max} passed")
+
+
+@cocotb.test(skip=os.environ.get("ALLOW_K0") != "1")
+async def test_bad_k_start_ignored(dut):
+    """A start with k_in == 0 or k_in > K_MAX changes nothing and raises err_k.
+
+    The command latches and the parameter loader use the same accept as
+    ctrl_fsm, so neither may move. step() checks err_k on every cycle.
+
+    Needs +ctrl_fsm_allow_k0 +gemm_tile_allow_bad_k (make ALLOW_K0=1) to
+    switch off the simulation-only $fatal for each case.
     """
     h = GemmHarness(dut)
     await h.start()
     k = get_k()
     tile = await h.new_tile(k)
     await h.run([tile])
+
     def latched():
         return tuple(read_int(getattr(dut, name), name) for name in
-                     ("p_loaded", "p_req", "a_base_q", "b_base_q", "p_base_q", "zp_q", "relu_q"))
+                     ("p_loaded", "p_req", "b_base_q", "p_base_q", "zp_q", "relu_q"))
 
     before = latched()
     assert before[0] == (1 << h.n) - 1 and before[1] == 0
-    # every field differs from what the last tile latched
-    bogus = Tile(0, tile.a_base ^ 1, tile.b_base ^ 1, tile.p_base ^ 1,
-                 tile.zero_point ^ 1, tile.relu_en ^ 1, [], tile.params)
-    for _ in range(3):
-        accepted, _ = await h.step(tile=bogus, tready=1)
-        # ready is high, so the harness counts it; the DUT must not
-        h.running, h.accepts = [], h.accepts - int(accepted)
-        assert latched() == before, (
-            f"a k_in == 0 start changed the latched command or restarted the "
-            f"parameter loader: {before} -> {latched()}"
-        )
-    for _ in range(h.model.tile_period(k)):
-        _, beat = await h.step(tready=1)
-        assert beat is None and read_int(dut.busy, "busy") == 0
-        assert latched() == before
+    bad_ks = [0, h.k_max + 1, (1 << h.kw) - 1]
+    for bad_k in bad_ks:
+        # every field differs from what the last tile latched
+        bogus = Tile(bad_k, tile.b_base ^ 1, tile.p_base ^ 1, tile.zero_point ^ 1,
+                     tile.relu_en ^ 1, [], tile.params, [])
+        for _ in range(3):
+            accepted, _ = await h.step(tile=bogus, tready=1)
+            assert not accepted
+            assert read_int(dut.err_k, "err_k") == 1, f"no err_k for k_in={bad_k}"
+            assert latched() == before, (
+                f"a k_in={bad_k} start changed the latched command or restarted "
+                f"the parameter loader: {before} -> {latched()}"
+            )
+        for _ in range(h.model.tile_period(k)):
+            _, beat = await h.step(tready=1)
+            assert beat is None and read_int(dut.busy, "busy") == 0
+            assert latched() == before
+    # the same starts while a tile is running are not starts at all: ready is
+    # low, so err_k must stay low too (step() checks it on every cycle)
+    accepted, _ = await h.step(tile=tile, tready=1)
+    assert accepted
+    busy_cycles = 0
+    while h.expected:
+        bogus = Tile(h.rng.choice(bad_ks), tile.b_base ^ 1, tile.p_base ^ 1,
+                     tile.zero_point ^ 1, tile.relu_en ^ 1, [], tile.params, [])
+        await h.step(tile=bogus if read_int(dut.busy, "busy") else None, tready=1)
+        busy_cycles += read_int(dut.busy, "busy")
+    assert busy_cycles > k
+    await h.settle()
     await h.run([tile], "random")
+    dut._log.info(f"starts with k_in in {bad_ks} ignored, err_k raised")

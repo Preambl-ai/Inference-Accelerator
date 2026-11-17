@@ -41,6 +41,7 @@ jobs:
           python memory/model/bram_model.py
           python axis/model/skid_buffer_model.py
           PYTHONPATH=systolic_array/model python gemm_tile/model/gemm_tile_model.py
+          PYTHONPATH=memory/model python im2col/model/im2col_model.py
 
       - name: systolic array sweep
         run: make sweep-array
@@ -59,6 +60,9 @@ jobs:
 
       - name: gemm_tile sweep
         run: make sweep-gemm
+
+      - name: im2col_reader sweep
+        run: make sweep-im2col
 
       - name: Upload results
         if: always()
