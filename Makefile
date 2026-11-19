@@ -19,11 +19,14 @@ ALLOW_K0    ?= 0
 ADDR_WIDTH   ?= 10
 READ_LATENCY ?= 1
 B_ADDR_W     ?= 13
+NBUF         ?= 3
+ALLOW_BAD_SEL ?= 0
 SEED ?=
 export SEED
 export K
 export N
 export ALLOW_K0
+export ALLOW_BAD_SEL
 
 # Find RTL by module name inside any block folder (systolic_array/rtl, memory/rtl, ...)
 RTL_ALL := $(wildcard $(PWD)/*/rtl/*.sv)
@@ -121,9 +124,23 @@ COMPILE_ARGS += -Pim2col_reader.READ_LATENCY=$(READ_LATENCY)
 SIM_BUILD = sim_build/im2col_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
 endif
 
+ifeq ($(MODULE_NAME),act_buffer)
+VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv
+COMPILE_ARGS += -Pact_buffer.N=$(N)
+COMPILE_ARGS += -Pact_buffer.DATA_WIDTH=$(DATA_WIDTH)
+COMPILE_ARGS += -Pact_buffer.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pact_buffer.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pact_buffer.NBUF=$(NBUF)
+# the bad-select test needs the simulation-only $$fatal switched off
+ifeq ($(ALLOW_BAD_SEL),1)
+PLUSARGS += +act_buffer_allow_bad_sel
+endif
+SIM_BUILD = sim_build/act_n_$(N)_dw_$(DATA_WIDTH)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)
+endif
+
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -235,4 +252,29 @@ sweep-im2col:
 	done
 	@echo "=== im2col_reader sweep passed ==="
 
-sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col
+# NBUF=3 leaves select 3 unused and NBUF=1 leaves select 1 unused: those are
+# the configs where an out-of-range select exists, so ALLOW_BAD_SEL runs there
+sweep-act:
+	@for n in 1 4 8; do \
+	  for rl in 1 2; do \
+	    for nb in 2 3 4; do \
+	      echo "=== N=$$n READ_LATENCY=$$rl NBUF=$$nb ==="; \
+	      $(MAKE) -s MODULE_NAME=act_buffer N=$$n READ_LATENCY=$$rl NBUF=$$nb ADDR_WIDTH=6 || exit 1; \
+	    done; \
+	  done; \
+	done
+	@for rl in 1 2; do \
+	  echo "=== N=4 READ_LATENCY=$$rl NBUF=1 (one bank, 1-bit select) ==="; \
+	  $(MAKE) -s MODULE_NAME=act_buffer N=4 READ_LATENCY=$$rl NBUF=1 ADDR_WIDTH=6 || exit 1; \
+	  echo "=== N=4 READ_LATENCY=$$rl NBUF=1 ALLOW_BAD_SEL=1 (select 1 names no bank) ==="; \
+	  $(MAKE) -s MODULE_NAME=act_buffer N=4 READ_LATENCY=$$rl NBUF=1 ADDR_WIDTH=6 ALLOW_BAD_SEL=1 || exit 1; \
+	  echo "=== N=4 READ_LATENCY=$$rl NBUF=3 ALLOW_BAD_SEL=1 (select 3 names no bank) ==="; \
+	  $(MAKE) -s MODULE_NAME=act_buffer N=4 READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=6 ALLOW_BAD_SEL=1 || exit 1; \
+	  echo "=== N=3 DATA_WIDTH=5 READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=2 (odd lanes, 4-word banks) ==="; \
+	  $(MAKE) -s MODULE_NAME=act_buffer N=3 DATA_WIDTH=5 READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=2 || exit 1; \
+	  echo "=== N=8 READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=10 (full-depth banks) ==="; \
+	  $(MAKE) -s MODULE_NAME=act_buffer N=8 READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=10 || exit 1; \
+	done
+	@echo "=== act_buffer sweep passed ==="
+
+sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act
