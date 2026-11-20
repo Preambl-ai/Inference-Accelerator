@@ -160,11 +160,15 @@ checks this with a canary fill of the whole destination bank.
 | B and P memories | host, `b_we`/`p_we` | gemm_tile reads; the host must not write |
 
 The host loads the input image, B and P before `start`. Nothing touches memory
-while `busy`. In simulation, `host_mode`, `host_we`, `b_we` or `p_we` while
-busy is a `$fatal` (it is undefined in hardware: `host_mode` would freeze
-act_buffer's reads under im2col_reader's free-running tag pipeline, see the act_buffer
-contract). `host_mode = 1` at start is rejected (E_HOST below) rather than
-undefined, because it is cheap to see.
+while `busy`. In hardware, touching memory while the layer runs is undefined:
+`host_mode` would freeze act_buffer's reads under im2col_reader's
+free-running tag pipeline (see the act_buffer contract). In simulation,
+`host_mode`, `b_we` or `p_we` while the layer runs (after the check phase)
+is a `$fatal`. `host_we` has no effect without `host_mode`, so the
+`host_mode` check covers it. The check phase is left out on purpose: no
+memory is accessed there, and it is where `host_mode = 1` at start is
+rejected (E_HOST below). That case is rejected rather than undefined
+because it is cheap to see.
 
 ## Illegal configurations
 
@@ -177,7 +181,7 @@ pass, the layer runs and `err_code` reads 0.
 | bit | name | rejected when | why it is rejected instead of left undefined |
 | --- | ---- | ------------- | --------------------------------------------- |
 | 0 | E_DIM | any of h_in, w_in, h_out, w_out, cin_words, cout_words, kh, kw, stride is 0 | im2col_reader `$fatal`s on several of these; a zero loop count would underflow the sequencer's counters |
-| 1 | E_SHAPE | `h_out != (h_in + 2*pad - kh)/stride + 1` (floor), or `kh > h_in + 2*pad`; the same for w | the reader would walk outside what the layer means; a host packing bug shows up here first |
+| 1 | E_SHAPE | `h_out != (h_in + 2*pad - kh)/stride + 1` (floor), or `kh > h_in + 2*pad`; the same for w. Only reported when E_DIM is clear, since with a zero size or stride the formula has no meaning | the reader would walk outside what the layer means; a host packing bug shows up here first |
 | 2 | E_K | `K = kh*kw*cin_words*N > K_MAX` | gemm_tile would drop the start (err_k) and the sequencer would wait forever for a tlast |
 | 3 | E_BMEM | `b_base + cout_words*K > 2**B_ADDR_W` | the last group's weights would wrap onto group 0 |
 | 4 | E_PMEM | `p_base + cout_words*N > 2**P_ADDR_W` | same, for P |
@@ -208,10 +212,20 @@ Not checked, documented instead:
   layer on the same cycle.
 * `err` and `done` never pulse for the same command.
 
-Measured cycle counts (filled in from simulation):
+Measured cycle counts, in edges after the one that accepts `start`
+(L = READ_LATENCY, G = K/N slice groups, T = ceil(h_out*w_out/N) * cout_words
+tiles). Measured on N 2/4/8 x L 1/2:
 
-    check phase, start to err/run: TBD
-    start to done: TBD, compared in the summary with the gemm_tile/im2col formulas
+    rejected command: err (and ready) visible 4 edges after start, for every check
+    start to done:    4 + T * (L + K + 3N + 4  +  G*(N + L + 2) - L  +  3)
+
+The per-tile term is the documented gemm_tile last-beat latency
+(L + K + 3N + 4), plus the reference im2col_reader's refill stall (G groups of
+N + L + 2, less the L cycles the B read already runs ahead), plus 3 edges of
+conv_layer: write-back capture, the write itself, and the next tile's
+accept. The formula matches simulation exactly in every run of the sweep.
+A feeder that never stalls (the pipelined version) would remove the
+G*(N + L + 2) - L term, which is most of the tile at small N.
 
 ## Reset
 
