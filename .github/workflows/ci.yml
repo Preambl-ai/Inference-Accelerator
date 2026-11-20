@@ -43,6 +43,7 @@ jobs:
           PYTHONPATH=systolic_array/model python gemm_tile/model/gemm_tile_model.py
           PYTHONPATH=memory/model python im2col/model/im2col_model.py
           PYTHONPATH=memory/model python memory/model/act_buffer_model.py
+          PYTHONPATH=systolic_array/model python conv_layer/model/conv_layer_model.py
 
       - name: systolic array sweep
         run: make sweep-array
@@ -67,6 +68,9 @@ jobs:
 
       - name: act_buffer sweep
         run: make sweep-act
+
+      - name: conv_layer sweep
+        run: make sweep-conv
 
       - name: Upload results
         if: always()
