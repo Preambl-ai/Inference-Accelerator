@@ -309,11 +309,22 @@ layer can already be done, and done is cleared by the next start.
   RX (synchronized); our TX is a flop driving the FT2232H's RX; the LEDs are
   outputs. Nothing else enters or leaves the clock domain.
 
-## 6. Measured figures (filled in from simulation)
+## 6. Measured figures (from simulation)
 
-    CSR register read, AR accepted to RVALID: TBD edges
-    ACT window read, AR accepted to RVALID:  TBD edges (READ_LATENCY 1 and 2)
-    bridge: last byte of a write32 packet to the first response byte: TBD
+    CSR register read:  RVALID 1 edge after the AR handshake edge
+    ACT window read:    RVALID READ_LATENCY + 2 edges after the AR handshake
+                        (3 at READ_LATENCY 1, 4 at READ_LATENCY 2; csr TB,
+                        N 2/4/8). host_rd_en is high for exactly
+                        READ_LATENCY edges at one address (checked per read)
+    bridge, write32:    the response's start bit begins 2 clocks after the
+                        request's last stop bit ends (top TB, CLKS_PER_BIT 8).
+                        uart_rx hands over a byte in the middle of its stop
+                        bit, so the AXI write fits in that half bit
+    CYCLES on the bus:  equals the conv_layer formula for every layer the top
+                        TB runs; a rejected command reads 4 (the check phase)
+
+All of these are a few clocks; at 1 Mbaud one byte is 1000 clocks, so the link
+time in section 1 is the whole story.
 
 ## Out of scope
 
