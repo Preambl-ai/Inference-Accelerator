@@ -21,6 +21,10 @@ READ_LATENCY ?= 1
 B_ADDR_W     ?= 13
 NBUF         ?= 3
 ALLOW_BAD_SEL ?= 0
+# UART bit period in clocks for the uart, bridge and top sims
+CLKS_PER_BIT ?= 16
+# bridge inter-byte timeout in bit times (the board uses 1000)
+TIMEOUT_BITS ?= 40
 # conv_layer needs a source and a destination bank
 CONV_NBUF ?= 2
 LAYERS ?=
@@ -42,7 +46,8 @@ COCOTB_TEST_MODULES = test_$(MODULE_NAME)
 # Every block's tb/ and model/ folder is importable, so imports stay flat
 empty :=
 space := $(empty) $(empty)
-export PYTHONPATH := $(subst $(space),:,$(wildcard $(PWD)/*/tb $(PWD)/*/model)):$(PYTHONPATH)
+# host/ holds the protocol module the TBs share with the real host driver
+export PYTHONPATH := $(subst $(space),:,$(wildcard $(PWD)/*/tb $(PWD)/*/model) $(PWD)/host):$(PYTHONPATH)
 
 COMPILE_ARGS += -g2012
 
@@ -141,6 +146,38 @@ COMPILE_ARGS += -Pconv_layer.NBUF=$(CONV_NBUF)
 SIM_BUILD = sim_build/conv_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
 endif
 
+ifeq ($(MODULE_NAME),uart_loopback)
+VERILOG_SOURCES += $(PWD)/uart/rtl/uart_tx.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/tb/uart_loopback.sv
+COMPILE_ARGS += -Puart_loopback.CLKS_PER_BIT=$(CLKS_PER_BIT)
+SIM_BUILD = sim_build/uart_cpb_$(CLKS_PER_BIT)
+endif
+
+ifeq ($(MODULE_NAME),csr)
+COMPILE_ARGS += -Pcsr.N=$(N)
+COMPILE_ARGS += -Pcsr.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pcsr.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pcsr.NBUF=$(NBUF)
+SIM_BUILD = sim_build/csr_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)
+endif
+
+ifeq ($(MODULE_NAME),top)
+VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/rtl/uart_tx.sv
+VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/conv_layer/rtl/conv_layer.sv
+VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
+VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+COMPILE_ARGS += -Ptop.N=$(N)
+COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
+# fast sim: a short bit period and timeout, a heartbeat you can see toggle
+COMPILE_ARGS += -Ptop.CLKS_PER_BIT=$(CLKS_PER_BIT)
+COMPILE_ARGS += -Ptop.TIMEOUT_BITS=$(TIMEOUT_BITS)
+COMPILE_ARGS += -Ptop.HB_BIT=6
+SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)
+endif
+
 ifeq ($(MODULE_NAME),act_buffer)
 VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv
 COMPILE_ARGS += -Pact_buffer.N=$(N)
@@ -157,7 +194,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv check-flow sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -307,9 +344,39 @@ sweep-conv:
 	@$(MAKE) -s MODULE_NAME=conv_layer N=4 READ_LATENCY=2 ADDR_WIDTH=9 CONV_NBUF=3 || exit 1
 	@echo "=== conv_layer sweep passed ==="
 
+# UART: a bit period of 4 clocks (the shortest uart_rx accepts), 16, and the
+# board's 100 (1 Mbaud at 100 MHz)
+sweep-uart:
+	@for c in 4 16 100; do \
+	  echo "=== uart CLKS_PER_BIT=$$c ==="; \
+	  $(MAKE) -s MODULE_NAME=uart_loopback CLKS_PER_BIT=$$c || exit 1; \
+	done
+	@echo "=== uart sweep passed ==="
+
+# CSR: NBUF=3 leaves bank select 3 unmapped, so the DECERR case runs there
+sweep-csr:
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    for nb in 2 3; do \
+	      echo "=== csr N=$$n READ_LATENCY=$$rl NBUF=$$nb ==="; \
+	      $(MAKE) -s MODULE_NAME=csr N=$$n READ_LATENCY=$$rl NBUF=$$nb ADDR_WIDTH=6 || exit 1; \
+	    done; \
+	  done; \
+	done
+	@echo "=== csr sweep passed ==="
+
+# the whole board through its UART pins, with the fast bit period
+sweep-top:
+	@for cfg in "2 1" "4 1" "4 2"; do \
+	  set -- $$cfg; \
+	  echo "=== top N=$$1 READ_LATENCY=$$2 CLKS_PER_BIT=8 ==="; \
+	  $(MAKE) -s MODULE_NAME=top N=$$1 READ_LATENCY=$$2 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 || exit 1; \
+	done
+	@echo "=== top sweep passed ==="
+
 # fails if a sweep target is missing from sweep-all, or the Makefile lost its
 # trailing newline (how sweep-conv once got skipped without any failure)
 check-flow:
 	@python3 ci/check_flow.py Makefile
 
-sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top
