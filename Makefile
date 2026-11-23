@@ -157,7 +157,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -307,4 +307,9 @@ sweep-conv:
 	@$(MAKE) -s MODULE_NAME=conv_layer N=4 READ_LATENCY=2 ADDR_WIDTH=9 CONV_NBUF=3 || exit 1
 	@echo "=== conv_layer sweep passed ==="
 
-sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv
+# fails if a sweep target is missing from sweep-all, or the Makefile lost its
+# trailing newline (how sweep-conv once got skipped without any failure)
+check-flow:
+	@python3 ci/check_flow.py Makefile
+
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv

@@ -12,6 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # every sweep target must be in sweep-all, and the Makefile must end
+      # with a newline: either mistake once skipped a sweep silently
+      - name: Flow guard
+        run: python3 ci/check_flow.py Makefile
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
