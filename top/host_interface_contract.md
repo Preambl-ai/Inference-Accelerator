@@ -90,18 +90,39 @@ Host to board:
 * `HCRC` covers OP, ADDR and LEN; `DCRC` covers the data bytes.
 * A burst starts at word-aligned `ADDR` and steps by 4 per word.
 
-Board to host, exactly one response per packet:
+Board to host, exactly one response per packet, in one of two shapes:
 
-    0x5A  [DATA[4*(LEN+1)] for reads]  STATUS  RCRC[2]
+    data answer:   0x5A  DATA[4*(LEN+1)]  STATUS  RCRC[2]     read32 / burst read whose header was good
+    short answer:  0x5A  STATUS  RCRC[2]                       everything else
 
-`RCRC` covers the data and STATUS. STATUS comes **after** the data: a burst
-read streams each word out as soon as it has been read, so a bus error at
-word k is only known after words 0 .. k-1 have been sent. From word k on the
-bridge sends zeros, and STATUS reports the error. The host knows the
-response length from its own LEN. There is one outstanding packet at a time:
-the host waits for the response (or its own timeout) before it sends the next
-packet. Bytes that arrive while a response is being sent are dropped. That
-packet then times out and is retried.
+`RCRC` covers DATA (if any) and STATUS.
+
+* **A read packet with a good header always gets the data answer**, whatever
+  happens on the bus. A bus error at word k (SLVERR/DECERR) is known only
+  after words 0 .. k-1 are already on the wire. From word k on, the bridge
+  sends zeros, and STATUS reports the error.
+* **The short answer goes to every write packet, and to a read packet that
+  failed before any bus access**: HCRC, bad opcode/LEN, or timeout. After a
+  bad header, LEN cannot be trusted, so there is no data length to honour.
+  The host therefore accepts a 4-byte short answer with STATUS 0x03, 0x05 or
+  0x06 in place of the data answer it was waiting for.
+
+**Why STATUS comes after the data (a change from the reviewed draft).** The
+draft had `0x5A STATUS [DATA] RCRC`. That only works if the bridge knows the
+outcome of every bus read before it sends the first byte. Then it would
+need either a 1 KB buffer for a 256-word burst, or to read everything once
+to find the status and then again to send it. The bridge has neither: it
+reads a word, sends its 4 bytes, and reads the next. Moving STATUS behind
+the data costs nothing, because the host knows the length from its own LEN
+and checks RCRC over the whole answer anyway. Zero-filling after an error
+keeps the length fixed.
+
+There is one outstanding packet at a time: the host waits for the answer (or
+its own timeout) before it sends the next packet. Bytes that arrive while an
+answer is being sent are dropped and counted (STATUS.DROPPED, section 2), and
+the packet they belonged to then times out. In correct host code this never
+happens, so the host treats a nonzero count as a protocol fault in the host,
+not as a link error.
 
 | STATUS | meaning | what happened on the bus |
 | ------ | ------- | ------------------------ |
@@ -113,15 +134,24 @@ packet then times out and is retried.
 | 0x05 | bad opcode or LEN | nothing was done |
 | 0x06 | timeout | a packet stalled midway (a byte was dropped); it was discarded |
 
-The response arrives after the bus transfer has finished, so an OK write is
-already in the CSR or memory when the host sees the OK.
+For writes, the answer starts only after the last bus write has finished, so
+an OK write is already in the CSR or memory when the host sees the OK. For
+reads, the answer starts before the first bus read (the sync byte goes out
+first) and the words stream out as they are read.
+
+After the answer to an HCRC, DCRC or bad-opcode error, the bridge **drains**:
+it drops every byte until the line has been quiet for the inter-byte timeout,
+and these drops are not counted. The tail of a broken packet is therefore
+never parsed as a new one. After a timeout answer it does not drain,
+because the line is already quiet. The host waits two timeouts after any
+link-error answer before retrying, which covers both cases.
 
 ### Error detection: a dropped or corrupted byte is never silent
 
 * **Header:** the header is fully received and its HCRC checked before
-  anything reaches the bus. A bad header is answered with 0x03, and the bridge
-  then drops bytes until the line has been idle for the timeout. Address and
-  length are therefore trusted before they are used.
+  anything reaches the bus. A bad header gets the short answer with 0x03,
+  and then the bridge drains (above). Address and length are therefore
+  trusted before they are used.
 * **write32:** the 4 data bytes and DCRC are buffered, and the AXI write only
   happens after DCRC passes.
 * **Burst write:** words are written as they arrive (there is no 1 KB buffer
