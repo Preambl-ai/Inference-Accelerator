@@ -416,7 +416,13 @@ async def test_start_status_cycles(dut):
         await h.idle(2)
         for a in (A_STATUS, A_CYCLES, A_ERR_CODE, A_LAUNCH):
             await h.chk_read(a)
-        await h.chk_write(A_STATUS, 0xC)
+        # W1C one bit at a time: the bit that is not set first (it must
+        # leave the set one alone), then the set one. clearing both at once
+        # cannot tell the two bits apart; a mutation run showed that.
+        first, second = (0x4, 0x8) if code else (0x8, 0x4)
+        await h.chk_write(A_STATUS, first)
+        await h.chk_read(A_STATUS)
+        await h.chk_write(A_STATUS, second)
         await h.chk_read(A_STATUS)
     assert h.accepts == 4
 
@@ -447,6 +453,20 @@ async def test_busy_rules(dut):
     assert not h.busy
     for a in (A_STATUS, A_CYCLES, A_LAUNCH, A_CTRL):
         await h.chk_read(a)
+    # busy *with* host_mode on: a start written together with host_mode keeps
+    # conv_layer busy through its check phase (it then rejects with E_HOST).
+    # that is the one state where host_mode alone would let an ACT write
+    # through, so busy has to refuse it by itself. the stub stays busy long
+    # enough to test it; a mutation run found nothing else reached this state.
+    h.next_layer = (100000, 0)
+    await h.chk_write(A_CTRL, 1 | 4)
+    assert h.busy
+    for s in range(sa):
+        await h.chk_write(h.act_addr(0, 4, s), 0xABCD)
+    await h.chk_read(h.act_addr(0, 4, 0))
+    await h.chk_write(A_CTRL, 2)
+    await h.idle(2)
+    await h.chk_write(A_CTRL, 0)
 
 
 @cocotb.test()

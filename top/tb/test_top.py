@@ -338,6 +338,25 @@ async def test_link_errors(dut):
         got = await h.run(P.read32(P.A_SCRATCH, h.stats))
         assert got == 0x11111111, f"{name}: SCRATCH changed to {got:#x}"
         dut._log.info(f"{name}: answer {P.STATUS_NAMES.get(st, 'none')}, SCRATCH unchanged")
+    # every link error must throw away a half-staged wide word. P words are 53
+    # bits, so they take two slots at any N: stage slot 0, break a packet,
+    # then the top slot must be refused. (at N <= 4 an ACT or B word is one
+    # slot, so without this nothing at top level would notice a bridge that
+    # never raises link_err; a mutation run showed exactly that.)
+    lo, hi = h.hw.p_addr(5, 0), h.hw.p_addr(5, 1)
+    st, _ = await h.raw(P.pkt_write32(lo, 0x1234))
+    st2, _ = await h.raw(P.pkt_write32(hi, 0x5))
+    assert (st, st2) == (P.ST_OK, P.ST_OK), "control: a clean two-slot P write must commit"
+    for name, hook in (("DCRC", flip(10)), ("HCRC", flip(3)), ("TIMEOUT", drop(11))):
+        st, _ = await h.raw(P.pkt_write32(lo, 0x1234))
+        assert st == P.ST_OK
+        h.t.inject = hook
+        await h.raw(P.pkt_write32(P.A_SCRATCH, 0))
+        h.t.inject = None
+        await h.t.wait_idle()
+        st, _ = await h.raw(P.pkt_write32(hi, 0x5))
+        assert st == P.ST_SLVERR, (f"after a {name} error the staged P slot survived: "
+                                   f"top slot answered {P.STATUS_NAMES.get(st, st)}")
     # bad opcode and bad LEN
     for bad in (P.header(0x07, P.A_SCRATCH, 0), P.header(P.OP_WRITE32, P.A_SCRATCH, 3)):
         st, _ = await h.raw(bad)
