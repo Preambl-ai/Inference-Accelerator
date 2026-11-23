@@ -97,8 +97,19 @@ class ProtocolError(Exception):
     """a response that is short, unsynchronized or fails its CRC"""
 
 
+SHORT_ANSWER_STATUSES = (ST_HCRC, ST_BADOP, ST_TIMEOUT)
+
+
 def parse_response(raw: Optional[bytes], read_words: int = 0) -> Tuple[int, List[int]]:
+    """the data answer (read packets with a good header), or the 4-byte short
+    answer: every write, and a read that failed before any bus access
+    (HCRC, bad opcode/LEN, timeout) -- contract section 1"""
     want = response_len(read_words)
+    if raw is not None and read_words and 4 <= len(raw) < want:
+        short = bytes(raw[:4])
+        if (short[0] == SYNC_OUT and short[1] in SHORT_ANSWER_STATUSES
+                and crc16(short[1:2]) == short[2] | (short[3] << 8)):
+            return short[1], []
     if raw is None or len(raw) < want:
         raise ProtocolError(f"short response: {0 if raw is None else len(raw)} of {want} bytes")
     raw = bytes(raw[:want])
@@ -494,6 +505,13 @@ if __name__ == "__main__":
         parse_response(r[:-1], 2); chk("short response rejected", False, True)
     except ProtocolError:
         chk("short response rejected", True, True)
+    # the short answer to a read packet that failed before the bus
+    chk("short HCRC answer to a burst read", parse_response(build_response(ST_HCRC), 4), (ST_HCRC, []))
+    chk("short TIMEOUT answer to a read32", parse_response(build_response(ST_TIMEOUT), 1), (ST_TIMEOUT, []))
+    try:
+        parse_response(build_response(ST_OK), 1); chk("short OK answer to a read is not valid", False, True)
+    except ProtocolError:
+        chk("short OK answer to a read is not valid", True, True)
     chk("slot shift 16/32/64/53", [slot_shift(w) for w in (16, 32, 64, 53)], [0, 0, 1, 1])
     chk("slots round trip", from_slots(to_slots(0x1122334455667788, 64)), 0x1122334455667788)
     chk("P bytes", len(word_bytes((1 << 53) - 1, P_WIDTH)), 7)

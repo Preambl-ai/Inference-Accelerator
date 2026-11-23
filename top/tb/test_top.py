@@ -362,6 +362,17 @@ async def test_link_errors(dut):
         st, _ = await h.raw(bad)
         await h.t.wait_idle()
         assert st == P.ST_BADOP
+    # a read packet that fails before the bus gets the 4-byte short answer,
+    # and the host must read it as HCRC / BADOP, not as a garbled response
+    h.t.inject = flip(3)
+    st, words = await h.raw(P.pkt_burst_read(P.A_SCRATCH, 4), 4)
+    h.t.inject = None
+    await h.t.wait_idle()
+    assert (st, words) == (P.ST_HCRC, []), f"bad-header burst read: {st}, {words}"
+    assert len(h.t.log[-1][1]) == 4, "a short answer is exactly 4 bytes"
+    st, words = await h.raw(P.header(P.OP_READ32, P.A_SCRATCH, 2), 1)
+    await h.t.wait_idle()
+    assert (st, words) == (P.ST_BADOP, []), "read32 with LEN 2 must get the short BADOP answer"
     # a garbled *response* to a read: the host retries, gets the right value
     once = {"left": 1}
 
