@@ -208,6 +208,14 @@ bits [31:0].
   for ACT and B, and 7 bytes for P (bits 53..55 are 0). The host computes the
   same CRC over what it meant to write and compares before start, which
   catches anything that got past the link checks.
+* **A retried burst poisons the write CRC.** A burst write that failed its
+  DCRC has already committed some wrong words before the retry rewrote them,
+  and the running CRC keeps those bytes. Memory is right after the retry, but
+  the CRC can never match. So a load is all or nothing: the host clears the
+  CRCs, writes everything, compares, and repeats the whole load until one
+  pass is clean (`protocol.load`, at most 3 passes). The top TB injects a
+  flipped byte and a dropped byte into a real layer load and checks that this
+  path is taken and the output is still exact.
 * **ACT reads:** reading any slot reads the whole word from the act_buffer
   through conv_layer's host read port and returns that slot. The CSR holds
   `host_rd_en` high with the same address for READ_LATENCY edges and takes
