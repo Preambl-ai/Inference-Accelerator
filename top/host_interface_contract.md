@@ -139,18 +139,28 @@ an OK write is already in the CSR or memory when the host sees the OK. For
 reads, the answer starts before the first bus read (the sync byte goes out
 first) and the words stream out as they are read.
 
-After the answer to an HCRC, DCRC or bad-opcode error, the bridge **drains**:
-it drops every byte until the line has been quiet for the inter-byte timeout,
-and these drops are not counted. The tail of a broken packet is therefore
-never parsed as a new one. After a timeout answer it does not drain,
-because the line is already quiet. The host waits two timeouts after any
-link-error answer before retrying, which covers both cases.
+On an HCRC, DCRC or bad-opcode error, the bridge **drains first and answers
+second**:
+1. It drops every byte until the line has been quiet for the inter-byte
+   timeout. These drops are expected and not counted.
+2. Only then does it send the short answer.
+
+These errors can be decided while the host is still sending (a bad header
+is known after 9 bytes of what may be a 1 KB burst). An answer sent at once
+would overlap the rest of the host's own packet; the first STATUS.DROPPED
+test run caught exactly that. Draining first means an answer never overlaps
+anything the host sends, and the tail of a broken packet is never parsed as
+a new one.
+
+A timeout answer goes out at once, because the line is already quiet. The
+host's answer timeout (50 ms on the board, against a 1 ms drain) and its
+two-timeout wait after any link-error answer cover the drain.
 
 ### Error detection: a dropped or corrupted byte is never silent
 
 * **Header:** the header is fully received and its HCRC checked before
-  anything reaches the bus. A bad header gets the short answer with 0x03,
-  and then the bridge drains (above). Address and length are therefore
+  anything reaches the bus. After a bad header, the bridge drains and then
+  sends the short answer with 0x03 (above). Address and length are therefore
   trusted before they are used.
 * **write32:** the 4 data bytes and DCRC are buffered, and the AXI write only
   happens after DCRC passes.

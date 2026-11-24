@@ -390,6 +390,11 @@ async def test_link_errors(dut):
     assert st == P.ST_DECERR
     st, words = await h.raw(P.pkt_burst_read(P.B_BASE, 3), 3)
     assert st == P.ST_SLVERR and words == [0, 0, 0]
+    # every error above was the host's packet going wrong, never the host
+    # talking over an answer: the bridge must drain before it answers, so
+    # none of those packets' tails may have been counted as DROPPED
+    st = await h.run(P.check_dropped(h.stats))
+    assert P.dropped_count(st) == 0, "an error answer overlapped the rest of the host's packet"
 
 
 @cocotb.test()
