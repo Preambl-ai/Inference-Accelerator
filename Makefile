@@ -188,6 +188,16 @@ COMPILE_ARGS += -Ppool_harness.NBUF=$(CONV_NBUF)
 SIM_BUILD = sim_build/pool_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
 endif
 
+ifeq ($(MODULE_NAME),layer_engine)
+VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv
+VERILOG_SOURCES += $(CONV_SRCS)
+COMPILE_ARGS += -Player_engine.N=$(N)
+COMPILE_ARGS += -Player_engine.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Player_engine.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Player_engine.NBUF=$(CONV_NBUF)
+SIM_BUILD = sim_build/engine_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
+endif
+
 ifeq ($(MODULE_NAME),act_buffer)
 VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv
 COMPILE_ARGS += -Pact_buffer.N=$(N)
@@ -204,7 +214,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool check-flow sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -397,9 +407,22 @@ sweep-pool:
 	@$(MAKE) -s MODULE_NAME=pool_harness N=4 READ_LATENCY=2 ADDR_WIDTH=9 CONV_NBUF=3 || exit 1
 	@echo "=== pool sweep passed ==="
 
+# layer_engine: conv and pool sharing one act_buffer. NBUF=3 runs the E_SEL
+# "select >= NBUF" cases and a third bank
+sweep-engine:
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== layer_engine N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=layer_engine N=$$n READ_LATENCY=$$rl ADDR_WIDTH=10 || exit 1; \
+	  done; \
+	done
+	@echo "=== layer_engine N=4 READ_LATENCY=2 CONV_NBUF=3 ==="
+	@$(MAKE) -s MODULE_NAME=layer_engine N=4 READ_LATENCY=2 ADDR_WIDTH=10 CONV_NBUF=3 || exit 1
+	@echo "=== layer_engine sweep passed ==="
+
 # fails if a sweep target is missing from sweep-all, or the Makefile lost its
 # trailing newline (how sweep-conv once got skipped without any failure)
 check-flow:
 	@python3 ci/check_flow.py Makefile
 
-sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine

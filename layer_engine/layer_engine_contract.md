@@ -87,6 +87,22 @@ pass straight through. Every latency is therefore the engine's own:
 These are measured in the layer_engine TB, which asserts the conv and pool
 formulas on every command it runs.
 
+Measured in simulation (N 2/4/8, READ_LATENCY 1/2, NBUF 2/3):
+* Every conv count equals the conv_layer formula, every pool count the
+  pool_layer formula, including a command started in the cycle right after
+  the previous done.
+* A bad op shows err exactly 1 edge after start.
+* Forty starts of every op aimed at a running conv produce no second engine
+  and one done.
+
+Mutation pass: 9 bugs injected, 8 caught.
+* The survivor, "pool owns the port before conv", is equivalent: it only
+  differs when both engines are busy, which one start cannot cause (and which
+  is `$fatal`-guarded).
+* The pass also found a TB gap: no test drove `host_we` with `host_mode`
+  low. That is now covered (`test_idle_write_port_closed`) and catches "idle
+  write port opened to the host path".
+
 ## Reset
 
 Reset is synchronous and goes to every engine. The guarantees of the engine

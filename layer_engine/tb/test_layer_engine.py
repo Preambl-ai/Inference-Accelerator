@@ -311,3 +311,23 @@ async def test_host_reads_ignored_while_busy(dut):
     w.cancel()
     t.host.idle_host()
     await t.host.check_all("after the wiggled pool")
+
+
+@cocotb.test()
+async def test_idle_write_port_closed(dut):
+    """with no engine busy nothing may write except the host in host mode:
+    host_we with host_mode low (ignored by contract), and the engines' own
+    write ports, must leave every bank unchanged. (a mutation run showed no
+    test drove host_we without host_mode)"""
+    t = await fresh(dut)
+    d = t.dut
+    r = random.Random(t.seed)
+    for _ in range(300):
+        await FallingEdge(d.clk)
+        d.host_mode.value = 0
+        d.host_we.value = 1
+        d.host_waddr.value = r.randrange(t.host.depth)
+        d.host_wdata.value = r.getrandbits(8 * t.n)
+        d.host_wr_sel.value = r.randrange(t.nbuf)
+    t.host.idle_host()
+    await t.host.check_all("after host_we without host_mode")
