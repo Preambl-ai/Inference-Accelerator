@@ -1,0 +1,125 @@
+# wdma contract (weight DMA)
+
+`dma/rtl/wdma.sv` fetches a conv layer's weights (B) and requant parameters
+(P) from AXI4 memory (DDR3 through the MIG on the board) into the on-chip B
+and P memories, so a program is no longer limited to the weights that fit on
+chip. It also gives the CSR a single-beat path into the same memory, which is
+how the host loads weights into DDR over the UART. Every timing figure is
+measured in simulation.
+
+## Decisions made under rule 9
+
+### 1. Prefetch a layer into on-chip B/P, or stream B into the array per output group
+
+| | prefetch each layer before it runs (**chosen**) | stream per output group, double-buffered |
+| --- | --- | --- |
+| verified blocks touched | none: conv_core, gemm_tile and their B/P memories are unchanged; the on-chip B/P become a one-layer cache | gemm_tile and conv_core gain a "group ready" stall, and B is split into two halves the DMA and the array ping-pong between |
+| fetch cost | added in front of the layer: about K beats per output group, against K x ceil(h_out*w_out / N) compute cycles per group. Under 1 / (pixels per group) of the conv for every spatial layer; about equal to the conv for an FC layer (1x1 output) | hidden behind compute except the first group |
+| on-chip B needed | one layer's weights (cout_words x K words) | 2 x K words |
+| bursts | one burst per output group for B (split only at AXI's 256-beat and 4 KB limits), one per group for P | the same |
+
+**Chosen: prefetch.** It leaves every verified datapath block alone, and
+the cost lands on layers that are already cheap (FC layers are a few
+thousand cycles). The fetch time of every layer is measured and recorded
+separately from the layer's own cycle count (second half of the CYC window),
+so the cost is visible on the board. Streaming stays possible later without
+changing the descriptor format.
+
+### 2. Data width and what a beat holds
+
+AXI data is 64 bits (the MIG's native width on the Arty's 16-bit DDR3 at a
+4:1 ratio is 128; a 64-bit AXI port with the MIG's width converter, or the
+interconnect, is standard). One beat is one on-chip memory word:
+
+* B: a beat's low N*8 bits are one B word (N <= 8, checked at elaboration);
+  the upper bits are ignored. At N = 8 every byte is used.
+* P: a beat's low 53 bits are one P entry {shift, mult, bias}, the same
+  layout as the CSR's P window; bits 63:53 are ignored.
+
+The alternative, packing 64/(N*8) B words per beat at N < 8, saves DDR
+bandwidth only on builds that are too small to matter (the board is N = 8),
+and costs a gearbox in front of the B write port. Not taken.
+
+### 3. One burst in flight, or several
+
+**One AR outstanding (chosen).** The next burst's AR is issued after the
+current burst's RLAST. Each burst therefore pays the memory's read latency
+once. With the MIG's ~20-30 cycles and B bursts of K >= 72 beats (a 3x3 conv
+on 8 input channels at N = 8), that is at most ~30 % on the fetch, and the
+fetch is itself small next to the layer (decision 1). Several outstanding
+bursts would need a FIFO of destinations and a write tracker; not worth it
+until measurements on the board say so.
+
+### 4. Soft reset while a burst is in flight
+
+AXI does not allow a master to drop ARVALID before its handshake or to
+ignore R beats the slave still owes, and the MIG is not reset by the CSR's
+soft reset. So wdma's `reset` is the board reset only, and soft reset comes
+in as `abort`: no new burst is issued, an AR already presented is held until
+accepted, the rest of the current burst is accepted and thrown away (no B or
+P write after the abort edge), then wdma is idle. `busy` stays high until
+then. A host single-beat access cannot be in flight at a soft reset (the CSR
+serves one bus transaction at a time, and the soft reset is itself one).
+
+## Parameters
+
+| name | default | meaning |
+| --- | --- | --- |
+| N | 8 | B word = N bytes; N <= 8 |
+| B_ADDR_W, P_ADDR_W | 13, 8 | on-chip B and P address widths |
+| K_WIDTH | 11 | width of K (words per output group) |
+| CW_W | 7 | width of the group count (cout_words) |
+| AXI_AW | 32 | AXI byte address width |
+| AXI_IDW | 4 | AXI ID width; wdma always uses ID 0 and checks RID/BID = 0 |
+
+The datapath has **no multipliers**: group addresses are running sums
+(+K*8 bytes, +N*8 bytes), the 4 KB split is a subtraction of address bits,
+and the range checks are compares. DSP count: 0.
+
+## Ports
+
+| group | ports |
+| ----- | ----- |
+| fetch command | `f_start`, `f_b_src[AXI_AW-1:0]`, `f_p_src[AXI_AW-1:0]`, `f_k[K_WIDTH-1:0]`, `f_groups[CW_W-1:0]`, `f_b_dst[B_ADDR_W-1:0]`, `f_p_dst[P_ADDR_W-1:0]` |
+| fetch status | `f_ready`, `busy`, `f_done` (pulse), `f_err` (pulse), `f_err_code[3:0]` (held until the next start) |
+| host single beat | `h_req` (pulse, accepted only when `f_ready`), `h_we`, `h_addr[AXI_AW-1:0]` (4-byte aligned), `h_wdata[31:0]`, `h_ack` (pulse), `h_resp[1:0]` (the AXI response), `h_rdata[31:0]` |
+| abort | `abort` (pulse: soft reset) |
+| B/P write ports | `b_we`, `b_waddr`, `b_wdata[N*8-1:0]`, `p_we`, `p_waddr`, `p_wdata[52:0]` (the on-chip memories' host write ports; wdma drives them only while busy) |
+| AXI4 master | AR: `araddr, arlen, arsize, arburst, arid, arvalid, arready`; R: `rdata, rresp, rlast, rid, rvalid, rready`; AW: `awaddr, awlen, awsize, awburst, awid, awvalid, awready`; W: `wdata, wstrb, wlast, wvalid, wready`; B: `bresp, bid, bvalid, bready` |
+
+All bursts are INCR with `size = 3` (8 bytes). Host accesses are single
+beats (`len = 0`, `size = 3`) on the 8-byte word that holds the address; a
+write sets WSTRB to the addressed half (0x0F or 0xF0) and a read returns the
+addressed half.
+
+## Fetch
+
+    check (1 edge): groups == 0 or k == 0         -> E_DIM
+                    b_src or p_src not 8-aligned  -> E_ALIGN
+    for og in 0 .. groups-1:
+        B: K beats from b_src + og*K*8  ->  B[b_dst + og*K + i]
+           (as few INCR bursts as the 256-beat and 4 KB rules allow: one if K <= 256 and
+            the group does not cross a 4 KB line)
+           before the group: b_dst + (og+1)*K > 2^B_ADDR_W -> E_RANGE
+        P: N beats from p_src + og*N*8  ->  P[p_dst + og*N + j]
+           before the group: p_dst + (og+1)*N > 2^P_ADDR_W -> E_RANGE
+    any RRESP != OKAY, or RID != 0  -> E_RESP (the burst is drained to RLAST first)
+
+Error codes (`f_err_code`): bit 0 E_DIM, bit 1 E_ALIGN, bit 2 E_RANGE,
+bit 3 E_RESP. On an error, the groups before the failing one have been
+written in full; nothing of the failing group is guaranteed.
+
+## Host single beat
+
+Accepted on `h_req` when idle. A write issues AW and W together, waits for
+B and returns BRESP. A read issues AR (len 0), returns the addressed 32-bit
+half and RRESP. `h_ack` pulses with the response.
+
+## Reset
+
+`reset` is synchronous and is the board reset (the AXI slave is reset with
+it). `abort` follows decision 4.
+
+## Measured (filled in from simulation)
+
+    TBD
