@@ -1,5 +1,6 @@
 // top: Arty A7-35T board top. PC <-> USB-UART <-> uart_rx/uart_tx <->
-// uart_bridge (AXI4-Lite master) <-> csr <-> conv_layer.
+// uart_bridge (AXI4-Lite master) <-> csr <-> layer_engine (conv, pool on one
+// act_buffer).
 // contract: top/host_interface_contract.md.
 //
 // one clock domain. CLK_DIV = 1 runs everything on the 100 MHz board clock;
@@ -206,14 +207,22 @@ module top #(
         .done_sticky(done_sticky), .err_sticky(err_sticky)
     );
 
-    conv_layer #(
+    // layer_engine: conv, pool (and later add) on one act_buffer. the legacy
+    // CSR command is a conv, so op is tied to CONV here; pooling reaches the
+    // host through the descriptor sequencer (phase 3). E_MODE cannot occur
+    // with op fixed, so the CSR's 9-bit ERR_CODE still holds every bit.
+    logic [9:0] engine_err_code;
+    assign conv_err_code = engine_err_code[8:0];
+
+    layer_engine #(
         .N(N), .ADDR_WIDTH(ADDR_WIDTH), .READ_LATENCY(READ_LATENCY), .NBUF(NBUF),
         .K_MAX(K_MAX), .K_WIDTH(K_WIDTH), .B_ADDR_W(B_ADDR_W), .P_ADDR_W(P_ADDR_W),
         .DIM_W(DIM_W), .CW_W(CW_W)
-    ) u_conv (
+    ) u_engine (
         .clk(clk), .reset(sys_reset || soft_reset),
-        .start(conv_start), .ready(conv_ready), .busy(conv_busy), .done(conv_done),
-        .err(conv_err), .err_code(conv_err_code),
+        .start(conv_start), .op(3'd1), .ready(conv_ready), .busy(conv_busy), .done(conv_done),
+        .err(conv_err), .err_code(engine_err_code), .done_op(),
+        .conv_busy(), .pool_busy(), .tile_launch(),
         .h_in(h_in), .w_in(w_in), .h_out(h_out), .w_out(w_out),
         .cin_words(cin_words), .cout_words(cout_words), .kh(kh), .kw(kw),
         .stride(stride), .pad(pad), .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
