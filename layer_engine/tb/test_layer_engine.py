@@ -18,13 +18,15 @@ import numpy as np
 from act_host import ActHost
 import conv_layer_model as CM
 from conv_layer_model import HwParams, pack_act, pack_b, pack_p, random_layer, words
-from layer_engine_model import (OP_CONV, OP_GAVG, OP_MAX2, Banks, apply_conv, apply_pool, check,
+from layer_engine_model import (EXTRA_FIELDS, OP_ADD, OP_CONV, OP_GAVG, OP_MAX2, Banks, add_cmd_of,
+                                add_fields, apply_add, apply_conv, apply_pool, check, conv_bus,
                                 pool_cmd_of, pool_fields)
+import add_model as AM
 import pool_model as PM
 
 CMD_FIELDS = ("h_in", "w_in", "h_out", "w_out", "cin_words", "cout_words", "kh", "kw", "stride",
               "pad", "zp_in", "zp_out", "relu_en", "src_sel", "dst_sel", "src_base", "dst_base",
-              "b_base", "p_base")
+              "b_base", "p_base") + EXTRA_FIELDS
 
 
 class EngineTB:
@@ -70,7 +72,7 @@ class EngineTB:
             getattr(d, f"{name}_we").value = 0
 
     def conv_fields(self, layer):
-        return dict(layer.command(self.n), op=OP_CONV)
+        return dict(conv_bus(layer, self.n), op=OP_CONV)
 
     async def conv(self, layer, name, load_x=True, check_banks=False):
         if load_x:
@@ -104,10 +106,48 @@ class EngineTB:
         return res
 
 
+    async def add(self, cmd, name, check_banks=False):
+        f = add_fields(cmd)
+        assert check(OP_ADD, f, self.hw) == 0, f"stimulus bug {check(OP_ADD, f, self.hw):#x}"
+        res = await self.host.run(dict(f, op=OP_ADD))
+        assert res["kind"] == "done", f"{name}: rejected {res['err_code']:#x}"
+        assert int(self.dut.done_op.value) == OP_ADD
+        apply_add(self.banks, f, self.n)
+        est = AM.estimate_cycles(cmd, self.lat, int(self.dut.M_BITS.value))
+        assert res["cycles"] == est, f"{name}: add {res['cycles']} edges, formula {est} {self.where()}"
+        if check_banks:
+            await self.host.check_all(f"after {name}")
+        return res
+
+
 async def fresh(dut):
     t = EngineTB(dut)
     await t.start()
     return t
+
+
+@cocotb.test()
+async def test_residual_block(dut):
+    """a ResNet basic block on the real engine: y = conv(conv(x)), out =
+    relu(y + x) with different scales and zero points, whole banks checked.
+    two banks: the skip input shares bank 0 with the block's output"""
+    t = await fresh(dut)
+    n = t.n
+    three = t.nbuf >= 3
+    x = t.rng.integers(-128, 128, (4, 4, n))
+    l1 = random_layer(t.rng, t.hw, kh=3, kw=3, stride=1, pad=1, h_in=4, w_in=4, cin=n, cout=n,
+                      src_sel=0, dst_sel=1, src_base=0, dst_base=0, b_base=0, p_base=0)
+    l1.x = x
+    await t.conv(l1, "block conv1", check_banks=True)
+    l2 = random_layer(t.rng, t.hw, kh=3, kw=3, stride=1, pad=1, h_in=4, w_in=4, cin=n, cout=n,
+                      src_sel=1, dst_sel=2 if three else 0, src_base=0, dst_base=0 if three else 200,
+                      b_base=200, p_base=16)
+    l2.zp_in = l1.zp_out
+    await t.conv(l2, "block conv2", load_x=False, check_banks=True)
+    ma, mb, sh = AM.scales_to_params(0.031, 0.017, 0.04)
+    ac = AM.AddCmd(4, 4, 1, l2.dst_sel, l2.dst_base, 0, 0, 1, 300, za=l2.zp_out, zb=l1.zp_in,
+                   zo=int(t.rng.integers(-20, 21)), ma=ma, mb=mb, shift=sh, relu_en=1)
+    await t.add(ac, "block add (skip from x)", check_banks=True)
 
 
 @cocotb.test()
@@ -137,9 +177,15 @@ async def test_random_ops(dut):
     n = t.n
     for i in range(int(os.environ.get("LAYERS") or 8)):
         src, dst = [int(v) for v in t.rng.choice(t.nbuf, 2, replace=False)]
-        if i % 2 == 0:
+        if i % 3 == 0:
             layer = random_layer(t.rng, t.hw, max_dim=6, src_sel=src, dst_sel=dst)
             await t.conv(layer, f"random conv #{i}")
+        elif i % 3 == 1:
+            cmd, a, b = AM.random_cmd(t.rng, n, t.aw, t.nbuf, max_dim=4, max_cw=2,
+                                      m_bits=int(t.dut.M_BITS.value))
+            await t.host.host_write(cmd.src_sel, cmd.src_base, pack_act(a, n, cmd.za))
+            await t.host.host_write(cmd.src2_sel, cmd.src2_base, pack_act(b, n, cmd.zb))
+            await t.add(cmd, f"random add #{i}")
         else:
             cmd, x, zp = PM.random_cmd(t.rng, n, t.aw, t.nbuf, max_dim=6, max_cw=2)
             await t.host.host_write(cmd.src_sel, cmd.src_base, pack_act(x, n, zp))
@@ -209,12 +255,13 @@ async def test_start_while_busy_ignored(dut):
     dones = 0
     # hammer start with every op (and a pool aimed at bank 0) while conv runs
     for cyc in range(40):
-        d.op.value = [OP_MAX2, OP_GAVG, OP_CONV, 0][cyc % 4]
+        d.op.value = [OP_MAX2, OP_GAVG, OP_CONV, OP_ADD, 0][cyc % 5]
         d.dst_sel.value = 0
         d.start.value = 1
         await RisingEdge(d.clk)
         await ReadOnly()
-        assert int(d.conv_busy.value) and not int(d.pool_busy.value), "a second engine started"
+        assert int(d.conv_busy.value) and not int(d.pool_busy.value) and not int(d.add_busy.value), \
+            "a second engine started"
         dones += int(d.done.value)
         await FallingEdge(d.clk)
     d.start.value = 0
@@ -235,7 +282,7 @@ async def test_bad_op_and_error_codes(dut):
     runs"""
     t = await fresh(dut)
     n = t.n
-    for op in (0, 4, 5, 7):
+    for op in (0, 5, 6, 7):
         res = await t.host.run(dict(pool_fields(OP_MAX2, 4, 4, 1, 0, 1, 0, 0), op=op))
         assert res["kind"] == "err" and res["err_code"] == 1 << 9 and res["cycles"] == 1, res
         assert int(t.dut.done_op.value) == op

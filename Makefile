@@ -191,7 +191,7 @@ SIM_BUILD = sim_build/pool_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_
 endif
 
 ifeq ($(MODULE_NAME),layer_engine)
-VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv
+VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(PWD)/add/rtl/add_layer.sv
 VERILOG_SOURCES += $(CONV_SRCS)
 COMPILE_ARGS += -Player_engine.N=$(N)
 COMPILE_ARGS += -Player_engine.ADDR_WIDTH=$(ADDR_WIDTH)
