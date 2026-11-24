@@ -31,16 +31,17 @@ a pure simulation `$fatal` that no legal input can reach.
 | 1 CONV | conv_core | all conv_layer command fields |
 | 2 MAX2 | pool_layer (mode 1) | h_in, w_in, cin_words (as c_words), src_sel, dst_sel, src_base, dst_base |
 | 3 GAVG | pool_layer (mode 2) | the same |
+| 4 ADD | add_layer | h_in, w_in, cin_words (as c_words); src_sel/src_base (a), src2_sel/src2_base (b), dst_sel/dst_base; zp_in (za), zp_in2 (zb), zp_out (zo); add_ma, add_mb, add_shift; relu_en |
 | other | none | `err` with E_MODE (bit 9), 1 edge after start, nothing touched |
-
-Phase 2 adds op 4, ADD.
 
 ## Ports
 
 * **Command:** `start`, `op[2:0]`, and the conv_layer command fields (h_in,
   w_in, h_out, w_out, cin_words, cout_words, kh, kw, stride, pad, zp_in,
   zp_out, relu_en, src_sel, dst_sel, src_base, dst_base, b_base, p_base),
-  with conv_layer's widths. All are latched by the chosen engine on
+  with conv_layer's widths. The second add operand adds `src2_sel`,
+  `src2_base`, `zp_in2[7:0]` (signed), `add_ma[M_BITS-1:0]`,
+  `add_mb[M_BITS-1:0]` and `add_shift[3:0]`. All are latched by the chosen engine on
   `start & ready` and need not be held.
 * **Status:**
   * `ready = !busy`
@@ -49,7 +50,7 @@ Phase 2 adds op 4, ADD.
   * `err_code[9:0]`: the finishing engine's code, conv's 9 bits zero-extended;
     it holds until the next start
   * `done_op[2:0]`: the op that just finished, valid with done/err
-  * `conv_busy`, `pool_busy`
+  * `conv_busy`, `pool_busy`, `add_busy`
   * `tile_launch`: conv's per-tile pulse
 * **Memory:** the B/P write ports and the act_buffer host ports, exactly as
   on conv_layer. Their rules (idle only, host_mode for writes, host_mode
@@ -64,14 +65,15 @@ of them:
 
 ## Ownership and the checks
 
-    owner = conv_busy ? CONV : pool_busy ? POOL : HOST
+    owner = conv_busy ? CONV : pool_busy ? POOL : add_busy ? ADD : HOST
 
 * **Read port** (rd_en, rd_addr, rd_sel): the owner's. When the host owns
   it, `host_rd_*` drive it, as on conv_layer.
 * **Datapath write port**: the owner engine's. With no engine busy, the
   enable is held low, so an idle engine can never write.
 * **`start` while busy** is ignored, as for every engine.
-* **Simulation `$fatal`** if two engines are ever busy in the same cycle, or
+* **Simulation `$fatal`** if two engines (any pair of conv, pool and add) are
+  ever busy in the same cycle, or
   if an engine that does not own the port raises its write enable. Neither
   can be reached by legal input, so they guard the RTL, not the user.
 
