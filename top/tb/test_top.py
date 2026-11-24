@@ -218,8 +218,11 @@ async def test_layer_end_to_end(dut):
     for bank in range(h.hw.nbuf):
         await h.fill_bank(bank)
     for i in range(int(os.environ.get("LAYERS") or 3)):
+        # any source bank, any other bank as the destination (1 - src
+        # assumed two banks; with three it gave dst = -1 and E_SEL)
         src = int(h.rng.integers(0, h.hw.nbuf))
-        layer = small_layer(h, src_sel=src, dst_sel=1 - src)
+        dst = (src + int(h.rng.integers(1, h.hw.nbuf))) % h.hw.nbuf
+        layer = small_layer(h, src_sel=src, dst_sel=dst)
         await h.run_layer(layer, f"layer {i}")
     assert dut.led.value.to_unsigned() & 0b0100, "done LED is off"
 
