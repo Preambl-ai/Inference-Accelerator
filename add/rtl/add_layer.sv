@@ -132,9 +132,13 @@ module add_layer #(
     );
 
     logic [WORD_W-1:0] a_word;
-    logic signed [R_W-1:0] ra [0:N-1];
-    logic signed [R_W-1:0] rb [0:N-1];
+    // (a - za) and (b - zb), held at full accumulator width and shifted left
+    // one place per step, so step i adds them times 2^i with no barrel
+    // shifter; ma and mb shift right so bit 0 is always the current bit
+    logic signed [ACC_W-1:0] ra [0:N-1];
+    logic signed [ACC_W-1:0] rb [0:N-1];
     logic signed [ACC_W-1:0] acc [0:N-1];
+    logic [M_BITS-1:0] ma_s, mb_s;
 
     logic wb_valid, wb_final;
     logic [ADDR_WIDTH-1:0] wb_addr;
@@ -218,10 +222,12 @@ module add_layer #(
                         for (int j = 0; j < N; j++) begin
                             av = a_word[j*DATA_WIDTH +: DATA_WIDTH];
                             bv = rd_data[j*DATA_WIDTH +: DATA_WIDTH];
-                            ra[j]  <= R_W'(av) - R_W'(za_q);
-                            rb[j]  <= R_W'(bv) - R_W'(zb_q);
+                            ra[j]  <= ACC_W'(R_W'(av) - R_W'(za_q));
+                            rb[j]  <= ACC_W'(R_W'(bv) - R_W'(zb_q));
                             acc[j] <= '0;
                         end
+                        ma_s  <= ma_q;
+                        mb_s  <= mb_q;
                         bit_i <= '0;
                         state <= S_STEP;
                     end
@@ -229,10 +235,14 @@ module add_layer #(
 
                 // one bit of ma and one bit of mb per cycle, LSB first
                 S_STEP: begin
-                    for (int j = 0; j < N; j++)
-                        acc[j] <= acc[j]
-                                  + (ma_q[bit_i] ? (ACC_W'(ra[j]) <<< bit_i) : ACC_W'(0))
-                                  + (mb_q[bit_i] ? (ACC_W'(rb[j]) <<< bit_i) : ACC_W'(0));
+                    for (int j = 0; j < N; j++) begin
+                        acc[j] <= acc[j] + (ma_s[0] ? ra[j] : ACC_W'(0))
+                                         + (mb_s[0] ? rb[j] : ACC_W'(0));
+                        ra[j]  <= ra[j] <<< 1;
+                        rb[j]  <= rb[j] <<< 1;
+                    end
+                    ma_s <= ma_s >> 1;
+                    mb_s <= mb_s >> 1;
                     if (int'(bit_i) == M_BITS - 1) state <= S_OUT;
                     else bit_i <= bit_i + 1'b1;
                 end

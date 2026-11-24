@@ -153,8 +153,15 @@ The paper estimate in decision 1 first said `2L`. The measurement shows `L`:
 b's read is issued one cycle after a's, and a has already arrived by the time
 b does.
 
-Mutation pass: 13 injected bugs, all caught. They cover both zero points,
-which bank and multiplier each operand uses, the bit position of the
-shift-and-add, the last multiplier bit, rounding, both clamps, ReLU, the b
-pointer, the two bank checks, the reset gate on the write, and the output
-zero point.
+Mutation pass: 14 injected bugs, all caught. They cover both zero points,
+which bank and multiplier each operand uses, the shift of the
+shift-and-add, the bit order and the last bit of the multipliers, rounding,
+both clamps, ReLU, the b pointer, the two bank checks, the reset gate on the
+write, and the output zero point.
+
+Implementation note: step i must add `(a - za) * 2^i`. A variable shift by i
+would put two 19-bit barrel shifters in every lane, about 1 k LUT at N = 8.
+Instead, `a - za` and `b - zb` sit in accumulator-wide registers that shift
+left by one each step, and `ma` and `mb` shift right, so bit 0 is always the
+current bit. The arithmetic is the same, and the add TB and mutation pass were
+rerun on this version.
