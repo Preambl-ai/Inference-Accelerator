@@ -292,10 +292,16 @@ async def test_bad_op_and_error_codes(dut):
     f = dict(t.conv_fields(layer), dst_sel=layer.src_sel)
     res = await t.host.run(f)
     assert res["err_code"] == check(OP_CONV, f, t.hw) == 1 << 7, res
+    # add's code too: dst == a (E_SEL), and a region past the end (E_SRC).
+    # (a mutation run showed no add error ever reached layer_engine's err_code)
+    add_bad = [add_fields(AM.AddCmd(2, 2, 1, 0, 0, 0, 50, 0, 100)),
+               add_fields(AM.AddCmd(2, 2, 1, 0, t.host.depth - 2, 0, 50, 1, 0))]
     for op, pf in ((OP_GAVG, pool_fields(OP_GAVG, 3, 4, 1, 0, 1, 0, 0)),
-                   (OP_MAX2, pool_fields(OP_MAX2, 4, 4, 1, 1, 1, 0, 0))):
+                   (OP_MAX2, pool_fields(OP_MAX2, 4, 4, 1, 1, 1, 0, 0)),
+                   (OP_ADD, add_bad[0]), (OP_ADD, add_bad[1])):
         res = await t.host.run(dict(pf, op=op))
         assert res["kind"] == "err" and res["err_code"] == check(op, pf, t.hw), res
+        assert res["err_code"] != 0
     await t.host.check_all("after the rejected commands")
     await t.conv(layer, "good conv after the errors", check_banks=True)
 

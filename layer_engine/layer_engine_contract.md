@@ -105,6 +105,11 @@ Mutation pass: 9 bugs injected, 8 caught.
   low. That is now covered (`test_idle_write_port_closed`) and catches "idle
   write port opened to the host path".
 
+ADD-path mutation pass (phase 2): 5 bugs injected, all caught after one TB
+fix. The fix: no illegal add had ever reached layer_engine's `err_code`, so
+"add err_code not shown" survived until the error-code test gained two
+rejected adds (E_SEL and E_SRC).
+
 ## Reset
 
 Reset is synchronous and goes to every engine. The guarantees of the engine
