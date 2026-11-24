@@ -655,7 +655,16 @@ async def test_reload_same_addresses(dut):
     bases = h.random_bases(k)
     results = []
     for _ in range(3):
-        tile = await h.new_tile(k, bases=bases)
+        # each tile must give a different result from the one before, or the
+        # rewrite proves nothing. at N=1 a whole tile is one output byte, and
+        # random scales often clamp it to a rail, so a fresh draw repeats the
+        # previous result now and then; draw again rather than fail (CI hit
+        # this once with an unlucky seed). loading a redrawn tile just
+        # rewrites the same words.
+        for _ in range(50):
+            tile = await h.new_tile(k, bases=bases)
+            if not results or tile.beats != results[-1]:
+                break
         results.append(tile.beats)
         await h.run([tile], "random")
     assert results[0] != results[1] and results[1] != results[2], (

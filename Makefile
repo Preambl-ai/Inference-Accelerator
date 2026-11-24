@@ -21,6 +21,10 @@ READ_LATENCY ?= 1
 B_ADDR_W     ?= 13
 NBUF         ?= 3
 ALLOW_BAD_SEL ?= 0
+# conv_layer needs a source and a destination bank
+CONV_NBUF ?= 2
+LAYERS ?=
+export LAYERS
 SEED ?=
 export SEED
 export K
@@ -124,6 +128,19 @@ COMPILE_ARGS += -Pim2col_reader.READ_LATENCY=$(READ_LATENCY)
 SIM_BUILD = sim_build/im2col_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
 endif
 
+ifeq ($(MODULE_NAME),conv_layer)
+VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
+VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
+VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+COMPILE_ARGS += -Pconv_layer.N=$(N)
+COMPILE_ARGS += -Pconv_layer.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pconv_layer.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pconv_layer.NBUF=$(CONV_NBUF)
+SIM_BUILD = sim_build/conv_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
+endif
+
 ifeq ($(MODULE_NAME),act_buffer)
 VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv
 COMPILE_ARGS += -Pact_buffer.N=$(N)
@@ -140,7 +157,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -277,4 +294,17 @@ sweep-act:
 	done
 	@echo "=== act_buffer sweep passed ==="
 
-sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act
+# conv_layer runs the whole TB (random layers included) on every config. the
+# NBUF=3 run leaves bank select 3 unused, so the E_SEL "select >= NBUF" case runs
+sweep-conv:
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=conv_layer N=$$n READ_LATENCY=$$rl ADDR_WIDTH=9 || exit 1; \
+	  done; \
+	done
+	@echo "=== N=4 READ_LATENCY=2 CONV_NBUF=3 (bank select 3 names no bank) ==="
+	@$(MAKE) -s MODULE_NAME=conv_layer N=4 READ_LATENCY=2 ADDR_WIDTH=9 CONV_NBUF=3 || exit 1
+	@echo "=== conv_layer sweep passed ==="
+
+sweep-all: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv
