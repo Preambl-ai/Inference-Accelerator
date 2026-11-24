@@ -213,6 +213,17 @@ COMPILE_ARGS += -Padd_harness.NBUF=$(ADD_NBUF)
 SIM_BUILD = sim_build/add_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)
 endif
 
+# weight DMA against the Python AXI4 slave (latency and backpressure from the env)
+AXI_LAT ?= 3
+AXI_STALL ?= 0
+export AXI_LAT
+export AXI_STALL
+ifeq ($(MODULE_NAME),wdma)
+COMPILE_ARGS += -Pwdma.N=$(N)
+COMPILE_ARGS += -Pwdma.B_ADDR_W=$(B_ADDR_W)
+SIM_BUILD = sim_build/wdma_n_$(N)_baw_$(B_ADDR_W)
+endif
+
 ifeq ($(MODULE_NAME),seq_harness)
 VERILOG_SOURCES += $(PWD)/sequencer/tb/seq_harness.sv $(PWD)/sequencer/rtl/sequencer.sv
 VERILOG_SOURCES += $(PWD)/layer_engine/rtl/layer_engine.sv $(PWD)/pool/rtl/pool_layer.sv
