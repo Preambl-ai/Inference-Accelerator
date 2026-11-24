@@ -154,6 +154,21 @@ Bits 2-4 (conv's K, B and P memory checks) are always 0 here.
   enable is gated with `!reset`. Every destination word holds either its old
   value or its final one, never a partial result. Ready is high after reset.
 
-## Measured (filled in from simulation)
+## Measured (from simulation, N 1/2/4/8 x READ_LATENCY 1/2)
 
-    TBD
+These are edge counts from the edge that accepts `start` (L = READ_LATENCY):
+
+    check phase (err visible)  : DIM_W + CW_W + 1 = 16 edges, for every check
+    start to done              : (DIM_W + CW_W + 1) + R + L + 1
+        R = reads = 4 * h_out * w_out * c_words   (MAX2)
+                  = h_in * w_in * c_words          (GAVG)
+    throughput                 : one act_buffer read per cycle; one output
+                                 word per 4 cycles (MAX2), per h*w cycles (GAVG)
+
+The formula matches simulation exactly in every TB run, and the TB asserts
+it. The `+ L + 1` is the last read's latency plus the write register.
+
+Mutation pass: 12 injected bugs, 11 caught. The survivor is equivalent: making
+the GAVG rounding constant unsigned turns `>>>` into a logical shift, but the
+zero-filled top bits enter at bit `ACC_W - S >= 24 - 15 = 9`. They never reach
+the 8 bits that are kept, so no input can tell the two apart.

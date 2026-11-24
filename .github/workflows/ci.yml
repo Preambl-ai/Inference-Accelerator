@@ -53,6 +53,7 @@ jobs:
           python uart/model/uart_model.py
           PYTHONPATH=host python csr/model/csr_model.py
           python ci/check_flow.py Makefile
+          PYTHONPATH=conv_layer/model:systolic_array/model python pool/model/pool_model.py
 
       - name: systolic array sweep
         run: make sweep-array
@@ -89,6 +90,9 @@ jobs:
 
       - name: top end-to-end sweep (UART pins, fast bit period)
         run: make sweep-top
+
+      - name: pool sweep
+        run: make sweep-pool
 
       - name: Upload results
         if: always()
