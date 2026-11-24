@@ -252,7 +252,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net check-flow sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net sweep-dma check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -473,6 +473,21 @@ sweep-add:
 	@$(MAKE) -s MODULE_NAME=add_harness N=4 READ_LATENCY=2 ADDR_WIDTH=9 ADD_NBUF=2 || exit 1
 	@echo "=== add sweep passed ==="
 
+# weight DMA: N against AXI latency and backpressure (wdma has no
+# READ_LATENCY; its timing comes from the slave). 0.3 stalls every channel
+# 30 % of cycles; latency 1 is the fastest a slave can answer
+sweep-dma:
+	@for n in 2 4 8; do \
+	  for cfg in "1 0" "12 0" "7 0.3"; do \
+	    set -- $$cfg; \
+	    echo "=== wdma N=$$n AXI_LAT=$$1 AXI_STALL=$$2 ==="; \
+	    $(MAKE) -s MODULE_NAME=wdma N=$$n AXI_LAT=$$1 AXI_STALL=$$2 || exit 1; \
+	  done; \
+	done
+	@echo "=== wdma B_ADDR_W=8 (small B: range errors near the top) ==="
+	@$(MAKE) -s MODULE_NAME=wdma N=4 B_ADDR_W=8 AXI_LAT=2 || exit 1
+	@echo "=== wdma sweep passed ==="
+
 # the descriptor sequencer driving the real layer_engine: random LeNet /
 # ResNet-style programs, errors, reset mid-program, back-to-back programs
 sweep-seq:
@@ -501,4 +516,4 @@ sweep-net:
 check-flow:
 	@python3 ci/check_flow.py Makefile
 
-sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net sweep-dma

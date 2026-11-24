@@ -184,7 +184,7 @@ class WdmaTB:
 
     def legal(self, k=None, groups=None):
         n = self.n
-        k = k or self.rng.randint(1, min(300, (1 << self.k_w) - 1))
+        k = k or self.rng.randint(1, min(300, (1 << self.k_w) - 1, 1 << self.b_aw))
         groups = groups or self.rng.randint(1, 4)
         groups = min(groups, ((1 << self.b_aw) // k), (1 << self.p_aw) // n)
         b_dst = self.rng.randint(0, (1 << self.b_aw) - groups * k)
