@@ -12,6 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # every sweep target must be in sweep-all, and the Makefile must end
+      # with a newline: either mistake once skipped a sweep silently
+      - name: Flow guard
+        run: python3 ci/check_flow.py Makefile
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -44,6 +49,10 @@ jobs:
           PYTHONPATH=memory/model python im2col/model/im2col_model.py
           PYTHONPATH=memory/model python memory/model/act_buffer_model.py
           PYTHONPATH=systolic_array/model python conv_layer/model/conv_layer_model.py
+          python host/protocol.py
+          python uart/model/uart_model.py
+          PYTHONPATH=host python csr/model/csr_model.py
+          python ci/check_flow.py Makefile
 
       - name: systolic array sweep
         run: make sweep-array
@@ -71,6 +80,15 @@ jobs:
 
       - name: conv_layer sweep
         run: make sweep-conv
+
+      - name: uart sweep
+        run: make sweep-uart
+
+      - name: csr sweep
+        run: make sweep-csr
+
+      - name: top end-to-end sweep (UART pins, fast bit period)
+        run: make sweep-top
 
       - name: Upload results
         if: always()
