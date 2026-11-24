@@ -210,6 +210,17 @@ COMPILE_ARGS += -Padd_harness.NBUF=$(ADD_NBUF)
 SIM_BUILD = sim_build/add_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)
 endif
 
+ifeq ($(MODULE_NAME),seq_harness)
+VERILOG_SOURCES += $(PWD)/sequencer/tb/seq_harness.sv $(PWD)/sequencer/rtl/sequencer.sv
+VERILOG_SOURCES += $(PWD)/layer_engine/rtl/layer_engine.sv $(PWD)/pool/rtl/pool_layer.sv
+VERILOG_SOURCES += $(PWD)/add/rtl/add_layer.sv $(CONV_SRCS)
+COMPILE_ARGS += -Pseq_harness.N=$(N)
+COMPILE_ARGS += -Pseq_harness.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Pseq_harness.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Pseq_harness.NBUF=$(ADD_NBUF)
+SIM_BUILD = sim_build/seq_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)
+endif
+
 ifeq ($(MODULE_NAME),act_buffer)
 VERILOG_SOURCES += $(PWD)/memory/rtl/bram.sv
 COMPILE_ARGS += -Pact_buffer.N=$(N)
