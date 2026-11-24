@@ -133,12 +133,16 @@ COMPILE_ARGS += -Pim2col_reader.READ_LATENCY=$(READ_LATENCY)
 SIM_BUILD = sim_build/im2col_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
 endif
 
+# everything a conv layer is built from, below conv_layer / layer_engine
+CONV_SRCS  = $(PWD)/conv_layer/rtl/conv_core.sv
+CONV_SRCS += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
+CONV_SRCS += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+
 ifeq ($(MODULE_NAME),conv_layer)
-VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
-VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+VERILOG_SOURCES += $(CONV_SRCS)
 COMPILE_ARGS += -Pconv_layer.N=$(N)
 COMPILE_ARGS += -Pconv_layer.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pconv_layer.READ_LATENCY=$(READ_LATENCY)
@@ -163,11 +167,7 @@ endif
 ifeq ($(MODULE_NAME),top)
 VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/rtl/uart_tx.sv
 VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/conv_layer/rtl/conv_layer.sv
-VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
-VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+VERILOG_SOURCES += $(CONV_SRCS)
 COMPILE_ARGS += -Ptop.N=$(N)
 COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)

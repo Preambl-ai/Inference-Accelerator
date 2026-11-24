@@ -47,6 +47,7 @@ set srcs {
     uart/rtl/uart_tx.sv
     uart/rtl/uart_bridge.sv
     conv_layer/rtl/conv_layer.sv
+    conv_layer/rtl/conv_core.sv
     gemm_tile/rtl/gemm_tile.sv
     im2col/rtl/im2col_reader.sv
     memory/rtl/act_buffer.sv
