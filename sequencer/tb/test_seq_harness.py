@@ -124,6 +124,11 @@ class SeqTB:
         assert kind == ("done" if e.err_index is None else "err"), f"{name}: ended {kind}"
         assert int(d.layers_done.value) == e.layers_done, \
             f"{name}: {int(d.layers_done.value)} layers done, expected {e.layers_done}"
+        if e.err_index is None:
+            # a program that reaches END reports no error, even right after one
+            # that failed (a mutation run found a stale code went unseen)
+            assert int(d.err_code.value) == 0, \
+                f"{name}: err_code {int(d.err_code.value):#x} after a program that reached END"
         if e.err_index is not None:
             assert (int(d.err_index.value), int(d.err_code.value)) == (e.err_index, e.err_code), \
                 f"{name}: error at {int(d.err_index.value)} code {int(d.err_code.value):#x}, " \
@@ -209,6 +214,12 @@ async def test_error_stops_the_program(dut):
     kind, edges, starts = await t.run_program()
     assert starts == 3, f"{starts} engine starts: the program did not stop at the bad descriptor"
     await t.check_network(net, 0, kind, edges, starts, "error at descriptor 2")
+    # a good program right after, no reset: it must end with err_code 0
+    good = NET.build(t.rng, t.hw, t.m_bits, plan=["conv3", "conv1"], read_latency=t.lat,
+                     desc_depth=t.depth)
+    await t.load(good)
+    kind, edges, starts = await t.run_program()
+    await t.check_network(good, 0, kind, edges, starts, "good program after the error")
 
 
 @cocotb.test()
