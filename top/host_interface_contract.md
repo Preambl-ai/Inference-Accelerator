@@ -200,7 +200,7 @@ DECERR. Refused accesses answer SLVERR and change nothing.
 | addr | name | access | reset | fields |
 | ---- | ---- | ------ | ----- | ------ |
 | 0x00 | ID | RO | 0x434E_5631 ("CNV1") | fixed. The host reads this first and stops on a mismatch |
-| 0x04 | VERSION | RO | 0x0001_0000 | [31:16] major, [15:0] minor of this map |
+| 0x04 | VERSION | RO | 0x0002_0000 | [31:16] major, [15:0] minor of this map. **2.0** adds the descriptor sequencer (PARAMS2, SEQ_*, DESC_WCRC, the DESC and CYC windows). Every 1.x register keeps its address and meaning, so a 1.x host (single layers) still works on a 2.0 board, and the host tells the two apart by the major |
 | 0x08 | PARAMS0 | RO | from parameters | [7:0] N, [11:8] READ_LATENCY, [19:12] ADDR_WIDTH, [23:20] NBUF, [31:24] B_ADDR_W |
 | 0x0C | PARAMS1 | RO | from parameters | [7:0] P_ADDR_W, [23:8] K_MAX |
 | 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses conv_layer `reset` for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets all three *_WCRC to 0xFFFF, reads 0 |
@@ -228,6 +228,11 @@ never sends before the answer is in:
 | 0x2C | B_WCRC | RO | 0xFFFF | the same for B |
 | 0x30 | P_WCRC | RO | 0xFFFF | the same for P |
 | 0x34 | LAUNCH_COUNT | RO | 0 | +1 on every accepted start (including starts that conv_layer later rejects with err). Wraps at 2^32 |
+| 0x38 | PARAMS2 (2.0) | RO | from parameters | [7:0] M_BITS (add rescale width), [15:8] DESC_DEPTH, [16] DMA present (phase 4) |
+| 0x90 | SEQ_CTRL (2.0) | WO | - | write [0] = 1: start the program at descriptor [15:8]. Refused (SLVERR) while busy. Reads as 0 |
+| 0x94 | SEQ_STATUS (2.0) | RO / W1C | 0 | [0] sequencer busy, [1] done (sticky), [2] err (sticky), [15:8] current descriptor, [31:16] layers finished in this program. Writing 1 to [1] or [2] clears it; a program start clears both |
+| 0x98 | SEQ_ERR (2.0) | RO | 0 | [31:16] index of the descriptor that failed, [10:0] its code: bits 0-9 are the engine's error bits, bit 10 is E_NOEND |
+| 0x9C | DESC_WCRC (2.0) | RO | 0xFFFF | running CRC-16 over every descriptor word written, 4 bytes LSB first; cleared by CTRL.clear_wcrc |
 | 0x40 .. 0x88 | command | RW | 0 | one field per register, low bits, in this order: H_IN, W_IN, H_OUT, W_OUT, CIN_WORDS, COUT_WORDS, KH, KW, STRIDE, PAD, ZP_IN, ZP_OUT, RELU_EN, SRC_SEL, DST_SEL, SRC_BASE, DST_BASE, B_BASE, P_BASE. Each is masked to its port width, so a read gives back what conv_layer will see. ZP_* read back sign-extended |
 
 The cycle counter uses the same edge count as the conv_layer TB, so on the
@@ -244,6 +249,8 @@ bits [31:0].
 | ACT | 0x10_0000 | `{bank, addr}` (SEL_WIDTH + ADDR_WIDTH bits) | 8N | read and write |
 | B | 0x20_0000 | `addr` (B_ADDR_W bits) | 8N | write only (reads are SLVERR) |
 | P | 0x30_0000 | `addr` (P_ADDR_W bits) | 53 | write only |
+| DESC (2.0) | 0x40_0000 | descriptor word `i*16 + k` (`< DESC_DEPTH*16`) | 32 | write only, one slot, commits at once |
+| CYC (2.0) | 0x50_0000 | descriptor `i` (`< DESC_DEPTH`) | 32 | read only: edges the descriptor's layer took (engine start to done) in the last program that ran it |
 
     byte address = base + ((word_index << SLOT_SHIFT) + slot) * 4
 
@@ -281,6 +288,30 @@ bits [31:0].
 * **B and P cannot be read back.** gemm_tile has no read port on them, and
   adding one is not needed. A wrong B or P word shows up as a wrong output,
   which the end-to-end compare checks byte for byte.
+
+### Programs (2.0)
+
+The descriptor format is in `sequencer/sequencer_contract.md`.
+`host/protocol.py` (`pack_descriptor`) is the one packer, shared by the
+host, the TBs and `run_network.py`. Host sequence for a network:
+
+    load the input image (ACT, host mode), every layer's B and P, and check the write CRCs
+    CTRL.clear_wcrc; burst-write the descriptors into DESC; compare DESC_WCRC
+    W1C SEQ_STATUS done|err; SEQ_CTRL = start | first << 8
+    poll SEQ_STATUS until done or err; read SEQ_ERR, then CYC[first .. first+layers-1]
+    read back whichever layer outputs it wants
+
+**Starting a program exactly once.** The sticky bits are cleared before the
+start, so after a lost answer "busy, or done/err set" means the program
+started, and nothing else does. The host then never resends a start that
+took.
+
+While the sequencer runs:
+* **STATUS.busy is 1**, and every rule of section 4 applies. On top of those,
+  SEQ_CTRL and CTRL.start are refused, and so are DESC writes and CYC reads.
+* **The legacy STATUS done/err bits, ERR_CODE, CYCLES and LAUNCH_COUNT do not
+  move.** They describe only commands started by CTRL.start; a program
+  reports through SEQ_STATUS, SEQ_ERR and CYC.
 
 ## 3. Act_buffer readback: why it cannot disturb a running layer
 
