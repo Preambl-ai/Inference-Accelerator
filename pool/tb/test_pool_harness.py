@@ -182,7 +182,11 @@ async def test_reset_mid_layer(dut):
                 else:
                     assert got[a] == old[a], f"mode {mode} reset at {at}: word {a} neither old nor final"
             if at == full:
-                assert written == len(final) - 1, "reset on the last edge must stop the last write"
+                # every word but the last was written. at N=1 a final value
+                # equals the junk already there 1 time in 256, so count only
+                # words where final differs from old (the add TB hit this)
+                want = sum(final[k] != old[cmd.dst_base + k] for k in range(len(final) - 1))
+                assert written == want, f"reset on the last edge: {written} written, expected {want}"
             await t.run_pool(cmd, f"rerun mode {mode} after reset at {at}")
 
 
