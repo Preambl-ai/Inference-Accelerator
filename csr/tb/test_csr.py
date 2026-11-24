@@ -76,6 +76,7 @@ class CsrHarness:
         self.seq_done = self.seq_err = 0
         self.seq_vals = dict(cur_index=0, layers_done=0, err_index=0, err_code=0)
         self.next_prog = ([5, 3], 0)    # (layer lengths, err_code of the last; 0 = done)
+        self.prog_gap = (1, 3)          # sequencer-only edges before the first layer, between layers
         self.prog = None                # [remaining layers, edges left in this one, gap]
         self.seq_starts = []            # start index of every program the stub accepted
         self.cyc = {}                   # cycle RAM: index -> count
@@ -153,7 +154,7 @@ class CsrHarness:
                 self.seq_busy = 1
                 self.seq_starts.append(s["seq_start_index"])
                 self.seq_vals.update(cur_index=s["seq_start_index"], layers_done=0)
-                self.prog = [list(self.next_prog[0]), 0, 1]
+                self.prog = [list(self.next_prog[0]), 0, self.prog_gap[0]]
                 self.prog_code = self.next_prog[1]
             elif self.seq_busy:
                 # like the real sequencer, busy outlasts the engine's last
@@ -180,7 +181,7 @@ class CsrHarness:
                         i = self.seq_vals["cur_index"]
                         self.cyc[i] = layers.pop(0)
                         prog_done_pulse = True
-                        self.prog[2] = 3
+                        self.prog[2] = self.prog_gap[1]
                         if layers:
                             self.seq_vals["layers_done"] += 1
                             self.seq_vals["cur_index"] = (i + 1) % self.desc_depth
@@ -760,6 +761,18 @@ async def test_program_start_status(dut):
     await h.chk_read(A_SEQ_STATUS)
     await h.chk_write(A_SEQ_CTRL, 0)                      # no start bit: nothing happens
     await h.settle()
+    # soft reset clears a done and an err left by finished programs (the
+    # sequencer is reset with layer_engine). a mutation run found no test
+    # soft-reset with a sticky set
+    await h.chk_read(A_SEQ_STATUS)
+    assert h.model.seq_done, "stimulus: the last program should have left done set"
+    await h.chk_write(A_CTRL, 2)
+    await h.chk_read(A_SEQ_STATUS)
+    h.next_prog = ([2], 0x40)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.settle()
+    await h.chk_write(A_CTRL, 2)
+    await h.chk_read(A_SEQ_STATUS)
     assert h.seq_starts == h.model.seq_starts, f"starts {h.seq_starts} vs model {h.model.seq_starts}"
 
 
@@ -790,6 +803,32 @@ async def test_program_busy_rules(dut):
     await h.chk_write(A_CTRL, 2)                          # soft reset stops it
     await h.idle(2)
     assert not h.seq_busy and not h.busy
+    # the same rules while only the sequencer is busy (fetching a descriptor,
+    # the engine idle). a mutation run showed busy ignoring the sequencer went
+    # unseen: every check above ran with the engine busy too
+    await h.chk_write(h.b_addr(2, 0), 9)
+    await h.chk_write(A_CTRL, 4)
+    await h.chk_write(h.act_addr(0, 5, 0), 9)
+    await h.chk_write(A_CTRL, 0)
+    h.prog_gap = (100000, 3)
+    h.next_prog = ([2], 0)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.idle(3)
+    assert h.seq_busy and not h.busy, "stimulus: the engine should be idle in the fetch gap"
+    await h.chk_write(A_CTRL, 1)                          # legacy start
+    await h.chk_write(A_CTRL, 4)                          # host_mode
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.chk_write(h.desc_addr(3), 0x55)
+    await h.chk_read(h.cyc_addr(0))
+    await h.chk_write(h.b_addr(2, sa - 1), 1)
+    await h.chk_read(h.act_addr(0, 5, 0))
+    for a in (A_STATUS, A_SEQ_STATUS, A_SCRATCH):
+        await h.chk_read(a)
+        await h.chk_write(a, 0xFFFFFFF0)
+    assert h.accepts == 0, "a legacy start got through during a program"
+    await h.chk_write(A_CTRL, 2)
+    await h.idle(2)
+    h.prog_gap = (1, 3)
     for a in (A_SEQ_STATUS, A_SEQ_ERR, A_STATUS, A_CYCLES):
         await h.chk_read(a)
     # a program after the soft reset runs normally
