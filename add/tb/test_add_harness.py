@@ -11,7 +11,7 @@ import random
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge, RisingEdge
+from cocotb.triggers import FallingEdge, ReadOnly, RisingEdge
 import numpy as np
 
 from act_host import ActHost
@@ -137,6 +137,63 @@ async def test_chained(dut):
     await t.load(c1, x, y)
     await t.run_add(c1, "x + y")
     await t.run_add(c2, name2)
+
+
+@cocotb.test()
+async def test_degenerate_and_back_to_back(dut):
+    """a 1x1x1 add; start held high through a run while the fields change
+    under it (ignored: the latched command finishes exactly as formula); the
+    same held start is accepted on the first edge after done"""
+    t = await fresh(dut)
+    d, n = dut, t.n
+    one = AddCmd(1, 1, 1, 0, 5, 0, 6, 1, 7, za=-128, zb=127, zo=-3, ma=37, mb=200, shift=8)
+    await t.load(one, t.rng.integers(-128, 128, (1, 1, n)), t.rng.integers(-128, 128, (1, 1, n)))
+    await t.run_add(one, "1x1x1")
+
+    a_cmd = AddCmd(2, 2, 1, 0, 20, 0, 30, 1, 40, za=4, zb=-6, zo=2, ma=90, mb=140, shift=7)
+    b_cmd = AddCmd(2, 2, 1, 0, 30, 0, 20, 1, 60, za=-6, zb=4, zo=-1, ma=255, mb=3, shift=9,
+                   relu_en=1)
+    await t.load(a_cmd, t.rng.integers(-128, 128, (2, 2, n)), t.rng.integers(-128, 128, (2, 2, n)))
+    exp_a, exp_b = t.expected(a_cmd), t.expected(b_cmd)
+
+    def drive(cmd):
+        for k, v in cmd.as_dict().items():
+            getattr(d, k).value = int(v) & ((1 << len(getattr(d, k))) - 1)
+
+    async def until_done():
+        edges = 0
+        while True:
+            await RisingEdge(d.clk)
+            edges += 1
+            await ReadOnly()
+            assert not int(d.err.value), "err during a legal add"
+            if int(d.done.value):
+                return edges
+            assert edges < 200000, "no done"
+
+    await FallingEdge(d.clk)
+    drive(a_cmd)
+    d.start.value = 1
+    await RisingEdge(d.clk)
+    await ReadOnly()
+    assert int(d.busy.value), "first start not accepted"
+    await FallingEdge(d.clk)
+    drive(b_cmd)                                  # start stays high: must be ignored while busy
+    edges = await until_done()
+    assert edges == estimate_cycles(a_cmd, t.lat, t.m_bits), \
+        f"first add: {edges} edges, formula {estimate_cycles(a_cmd, t.lat, t.m_bits)}"
+    await RisingEdge(d.clk)                       # start still high: accepted right after done
+    await ReadOnly()
+    assert int(d.busy.value), "a start on the first edge after done was not accepted"
+    await FallingEdge(d.clk)
+    d.start.value = 0
+    edges = await until_done()
+    assert edges == estimate_cycles(b_cmd, t.lat, t.m_bits), \
+        f"second add: {edges} edges, formula {estimate_cycles(b_cmd, t.lat, t.m_bits)}"
+    await FallingEdge(d.clk)
+    t.host.expect(a_cmd.dst_sel, a_cmd.dst_base, exp_a)
+    t.host.expect(b_cmd.dst_sel, b_cmd.dst_base, exp_b)
+    await t.host.check_all("after back-to-back adds")
 
 
 @cocotb.test()
