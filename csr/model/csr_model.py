@@ -34,6 +34,8 @@ class CsrModel:
         self.scratch = 0
         self.host_mode = 0
         self.done = self.err = 0
+        self.dropped = 0
+        self.dropped_count = 0
         self.cycles = 0
         self.launch = 0
         self.wcrc = {"act": 0xFFFF, "b": 0xFFFF, "p": 0xFFFF}
@@ -68,7 +70,8 @@ class CsrModel:
         return idx >> (self.b_aw if name == "b" else self.p_aw) == 0
 
     def status_word(self, busy):
-        return (self.host_mode << 4) | (self.err << 3) | (self.done << 2) | ((not busy) << 1) | busy
+        return ((self.dropped_count << 16) | (self.dropped << 5) | (self.host_mode << 4) |
+                (self.err << 3) | (self.done << 2) | ((not busy) << 1) | busy)
 
     def reg_value(self, off, busy, err_code):
         vals = {A_ID: ID_VALUE, A_VERSION: VERSION, A_PARAMS0: self.params0(),
@@ -114,6 +117,7 @@ class CsrModel:
             if off == A_STATUS:
                 if data & 4: self.done = 0
                 if data & 8: self.err = 0
+                if data & 0x20: self.dropped, self.dropped_count = 0, 0
                 return OKAY
             if off == A_SCRATCH:
                 if busy: return SLVERR
@@ -173,6 +177,11 @@ class CsrModel:
     def link_err(self):
         for st in self.stage.values():
             st["vld"] = set()
+
+    def link_dropped(self, n=1):
+        """n bytes dropped by the bridge mid-answer; the count saturates"""
+        self.dropped = 1
+        self.dropped_count = min(0xFFFF, self.dropped_count + n)
 
     # -- what conv_layer does back --------------------------------------------
     def accepted_start(self):
@@ -241,6 +250,14 @@ if __name__ == "__main__":
     chk("cycles and done", (m.read(A_CYCLES)[1], m.read(A_STATUS)[1] & 4, m.read(A_LAUNCH)[1]), (123, 4, 1))
     m.write(A_CTRL, 8)
     chk("clear_wcrc", m.read(A_ACT_WCRC)[1], 0xFFFF)
+    m.link_dropped(3)
+    chk("dropped flag and count", m.read(A_STATUS)[1] >> 16, 3)
+    m.accepted_start(); m.write(A_CTRL, 2)
+    chk("start and soft reset keep DROPPED", (m.read(A_STATUS)[1] >> 5) & 1, 1)
+    m.link_dropped(70000)
+    chk("count saturates at 0xFFFF", m.read(A_STATUS)[1] >> 16, 0xFFFF)
+    m.write(A_STATUS, 0x20)
+    chk("W1C bit 5 clears flag and count", m.read(A_STATUS)[1] & 0xFFFF0020, 0)
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)

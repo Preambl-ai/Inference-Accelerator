@@ -108,12 +108,20 @@ def main():
     try:
         hw, build = P.run_sync(P.identify(stats), t)          # first: is this our board?
         print(f"board: ID ok, build {build:#09x}, {hw}")
+        if stats.stale_dropped:
+            print(f"note: STATUS.DROPPED held {stats.stale_dropped} from an earlier session "
+                  f"(another program talking over the board?); cleared")
         layer = build_layer(args, hw, rng)
         cmd = layer.command(hw.n)
         exp = expected(layer, hw.n)
         imgs = layer_images(hw, layer)
         t0 = time.monotonic()
-        res = P.run_sync(P.run_layer(hw, cmd, imgs, len(exp), stats), t)
+        try:
+            res = P.run_sync(P.run_layer(hw, cmd, imgs, len(exp), stats), t)
+        except P.ProtocolFault as e:
+            print(f"PROTOCOL FAULT: {e}")
+            print("FAIL")
+            return 1
         dt = time.monotonic() - t0
     finally:
         t.close()

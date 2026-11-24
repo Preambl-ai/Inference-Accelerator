@@ -194,7 +194,22 @@ DECERR. Refused accesses answer SLVERR and change nothing.
 | 0x08 | PARAMS0 | RO | from parameters | [7:0] N, [11:8] READ_LATENCY, [19:12] ADDR_WIDTH, [23:20] NBUF, [31:24] B_ADDR_W |
 | 0x0C | PARAMS1 | RO | from parameters | [7:0] P_ADDR_W, [23:8] K_MAX |
 | 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses conv_layer `reset` for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets all three *_WCRC to 0xFFFF, reads 0 |
-| 0x14 | STATUS | RO / W1C | 0x2 | [0] busy, [1] ready, [2] done (sticky), [3] err (sticky), [4] host_mode. Writing 1 to [2] or [3] clears it; start also clears both |
+| 0x14 | STATUS | RO / W1C | 0x2 | [0] busy, [1] ready, [2] done (sticky), [3] err (sticky), [4] host_mode, [5] DROPPED (sticky), [31:16] DROPPED_COUNT. Writing 1 to [2] or [3] clears it; start and soft reset also clear both. Writing 1 to [5] clears DROPPED and DROPPED_COUNT together; nothing else clears them except the board reset (they are link state, not layer state) |
+
+**DROPPED / DROPPED_COUNT.** The bridge pulses once for every byte that
+arrives while an answer is going out. It still drops the byte, and the CSR
+sets DROPPED and adds one to DROPPED_COUNT, which saturates at 0xFFFF rather
+than wrapping to a harmless-looking 0. Bytes thrown away while the bridge
+drains after an error are expected and not counted. The host treats any
+nonzero count as a **protocol fault in the host**, because correct host code
+never sends before the answer is in:
+* After every failed exchange, before retrying, the host reads STATUS. If
+  DROPPED is set it raises `ProtocolFault` with the count instead of
+  retrying, so the fault never shows up as a string of CRC errors or
+  timeouts.
+* `poll_done` and the end of `run_layer` check it as well.
+* At connect, a count left over from an earlier session is reported and
+  cleared.
 | 0x18 | ERR_CODE | RO | 0 | conv_layer `err_code[8:0]`, holds until the next start |
 | 0x1C | CYCLES | RO | 0 | edges from the accepting edge to done (or err), latched there. Counts live while busy |
 | 0x20 | SCRATCH | RW | 0 | link test, no effect |

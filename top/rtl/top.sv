@@ -123,7 +123,7 @@ module top #(
     // UART and bridge
     // ------------------------------------------------------------------
     logic [7:0] rx_data, tx_data;
-    logic rx_valid, rx_frame_err, tx_valid, tx_ready, link_err;
+    logic rx_valid, rx_frame_err, tx_valid, tx_ready, link_err, rx_dropped;
 
     uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
         .clk(clk), .reset(sys_reset), .rx(uart_txd_in),
@@ -149,7 +149,7 @@ module top #(
         .clk(clk), .reset(sys_reset),
         .rx_data(rx_data), .rx_valid(rx_valid),
         .tx_data(tx_data), .tx_valid(tx_valid), .tx_ready(tx_ready),
-        .link_err(link_err),
+        .link_err(link_err), .rx_dropped(rx_dropped),
         .m_awaddr(awaddr), .m_awvalid(awvalid), .m_awready(awready),
         .m_wdata(wdata), .m_wstrb(wstrb), .m_wvalid(wvalid), .m_wready(wready),
         .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready),
@@ -188,7 +188,7 @@ module top #(
         .s_bresp(bresp), .s_bvalid(bvalid), .s_bready(bready),
         .s_araddr(araddr), .s_arvalid(arvalid), .s_arready(arready),
         .s_rdata(rdata), .s_rresp(rresp), .s_rvalid(rvalid), .s_rready(rready),
-        .link_err(link_err),
+        .link_err(link_err), .link_dropped(rx_dropped),
         .conv_soft_reset(soft_reset), .conv_start(conv_start), .conv_ready(conv_ready),
         .conv_busy(conv_busy), .conv_done(conv_done), .conv_err(conv_err),
         .conv_err_code(conv_err_code),

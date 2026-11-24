@@ -393,6 +393,64 @@ async def test_link_errors(dut):
 
 
 @cocotb.test()
+async def test_dropped_bytes_mid_answer(dut):
+    """bytes sent while the board is answering are dropped, but counted:
+    STATUS.DROPPED and DROPPED_COUNT show exactly how many, the answer itself
+    is intact, and the host reports a protocol fault instead of retrying"""
+    h = await fresh(dut)
+    t, clk = h.t, dut.CLK100MHZ
+    st = await h.run(P.check_dropped(h.stats))
+    assert not st & P.ST_DROPPED, "DROPPED set on a clean link"
+    words_in = [int(v) for v in h.rng.integers(0, 1 << (8 * h.n), 64)]
+    await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
+    await h.run(P.burst_write(h.hw.act_addr(0, 0), words_in, h.stats))
+    await h.run(P.write32(P.A_CTRL, 0, h.stats))
+    # a long answer (64 words), and 6 bytes sent into the middle of it; the
+    # bytes look like the start of a packet, so a parser that took them would
+    # be visibly derailed
+    pkt = P.pkt_burst_read(h.hw.act_addr(0, 0), 64)
+    want = P.response_len(64)
+    extra = bytes((0xA5, P.OP_WRITE32, 0x20, 0, 0, 0))
+    t.rx.clear()
+    await t.send(pkt)
+    while len(t.rx) < 3:
+        await ClockCycles(clk, 4 * h.cpb)
+    await t.send(extra)
+    assert len(t.rx) < want - 8, "the extra bytes did not land inside the answer"
+    while len(t.rx) < want:
+        await ClockCycles(clk, 4 * h.cpb)
+    status, words = P.parse_response(bytes(b for b, _ in t.rx[:want]), 64)
+    assert (status, words) == (P.ST_OK, words_in), "the answer was disturbed by the dropped bytes"
+    await t.wait_idle()
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert st & P.ST_DROPPED and P.dropped_count(st) == len(extra), \
+        f"STATUS {st:#x}: expected DROPPED with count {len(extra)}"
+    # the host side: any check is a ProtocolFault carrying the count...
+    try:
+        await h.run(P.check_dropped(h.stats))
+        assert False, "check_dropped did not raise"
+    except P.ProtocolFault as e:
+        assert e.count == len(extra)
+    # ...and so is a failed exchange: the host probes STATUS before retrying
+    # and stops, instead of retrying into a string of CRC errors
+    packets = h.stats.packets
+    first = t.packets + 1               # corrupt only this write, not the STATUS probe after it
+    h.t.inject = lambda k, b: b[:10] + bytes((b[10] ^ 1,)) + b[11:] if k == first else b
+    try:
+        await h.run(P.write32(P.A_SCRATCH, 1, h.stats))
+        assert False, "a failed exchange with DROPPED set was retried"
+    except P.ProtocolFault as e:
+        assert e.count == len(extra) and h.stats.packets == packets + 1
+    h.t.inject = None
+    # W1C clears flag and count together; the link is then clean again
+    await h.run(P.write32(P.A_STATUS, P.ST_DROPPED, h.stats))
+    st = await h.run(P.check_dropped(h.stats))
+    assert P.dropped_count(st) == 0
+    dut._log.info(f"{len(extra)} bytes sent mid-answer: answer intact, DROPPED_COUNT={len(extra)}, "
+                  f"host raised ProtocolFault")
+
+
+@cocotb.test()
 async def test_corrupted_burst_in_a_layer_load(dut):
     """a flipped byte and a dropped byte inside burst writes of a real layer
     load: DCRC / TIMEOUT answers, retries, the write-CRC check forces a clean

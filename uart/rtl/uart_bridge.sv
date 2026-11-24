@@ -23,6 +23,13 @@
 //
 // link_err pulses on every HCRC / DCRC / opcode / timeout error; the CSR uses
 // it to clear its half-staged wide words.
+//
+// rx_dropped pulses for every byte that arrives while an answer is going out
+// (the host must wait for the answer first, so such a byte is a host-side
+// protocol fault). the byte is still dropped, but the CSR counts it
+// (STATUS.DROPPED) so the fault is visible instead of surfacing later as a
+// mysterious CRC error or timeout. bytes thrown away while draining after an
+// error are expected and not counted.
 
 module uart_bridge #(
     parameter int CLKS_PER_BIT = 100,
@@ -41,6 +48,7 @@ module uart_bridge #(
     input  logic       tx_ready,
 
     output logic       link_err,
+    output logic       rx_dropped,       // a byte arrived mid-answer and was dropped
 
     // AXI4-Lite master
     output logic [ADDR_W-1:0] m_awaddr,
@@ -168,6 +176,7 @@ module uart_bridge #(
             byte_q      <= '0;
             idle_cnt    <= '0;
             link_err    <= 1'b0;
+            rx_dropped  <= 1'b0;
             m_awvalid   <= 1'b0;
             m_wvalid    <= 1'b0;
             m_arvalid   <= 1'b0;
@@ -189,7 +198,8 @@ module uart_bridge #(
             drain_after <= 1'b0;
             is_read     <= 1'b0;
         end else begin
-            link_err <= 1'b0;
+            link_err   <= 1'b0;
+            rx_dropped <= rx_valid && answering;
 
             // holding register and the idle timer
             if (rx_valid) begin

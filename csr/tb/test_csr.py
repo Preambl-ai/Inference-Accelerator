@@ -72,7 +72,7 @@ class CsrHarness:
         d = self.dut
         cocotb.start_soon(Clock(d.clk, 10, unit="ns").start())
         for s in ("s_awvalid", "s_wvalid", "s_bready", "s_arvalid", "s_rready", "link_err",
-                  "s_awaddr", "s_wdata", "s_araddr"):
+                  "link_dropped", "s_awaddr", "s_wdata", "s_araddr"):
             getattr(d, s).value = 0
         d.s_wstrb.value = 0xF
         self._drive_stub()
@@ -283,6 +283,16 @@ class CsrHarness:
         d.link_err.value = 0
         self.model.link_err()
 
+    async def pulse_dropped(self, n):
+        """n consecutive cycles of link_dropped (one per dropped byte)"""
+        d = self.dut
+        await FallingEdge(d.clk)
+        d.link_dropped.value = 1
+        for _ in range(n):
+            await FallingEdge(d.clk)
+        d.link_dropped.value = 0
+        self.model.link_dropped(n)
+
     def act_addr(self, sel, idx, slot=0):
         return ACT_BASE + ((((sel << self.aw) | idx) << slot_shift(8 * self.n)) + slot) * 4
 
@@ -470,6 +480,35 @@ async def test_busy_rules(dut):
 
 
 @cocotb.test()
+async def test_dropped_count(dut):
+    """DROPPED is sticky and DROPPED_COUNT counts each dropped byte; start and
+    soft reset leave both alone; W1C bit 5 clears both; the count saturates
+    at 0xFFFF instead of wrapping"""
+    h = await fresh(dut)
+    await h.chk_read(A_STATUS)
+    await h.pulse_dropped(1)
+    await h.chk_read(A_STATUS)
+    await h.pulse_dropped(4)
+    await h.chk_read(A_STATUS)
+    h.next_layer = (5, 0)
+    await h.chk_write(A_CTRL, 1)                          # start
+    while h.busy:
+        await h.idle(1)
+    await h.chk_write(A_CTRL, 2)                          # soft reset
+    await h.chk_write(A_STATUS, 0xC)                      # W1C of done/err only
+    await h.chk_read(A_STATUS)
+    assert (await h.read(A_STATUS))[1] >> 16 == 5
+    await h.chk_write(A_STATUS, 0x20)
+    await h.chk_read(A_STATUS)
+    # 65535 + 10 drops: must stop at 0xFFFF
+    await h.pulse_dropped(0xFFFF + 10)
+    resp, data, _ = await h.chk_read(A_STATUS)
+    assert data >> 16 == 0xFFFF and data & 0x20, f"STATUS {data:#x}: the count did not saturate"
+    await h.chk_write(A_STATUS, 0x20)
+    await h.chk_read(A_STATUS)
+
+
+@cocotb.test()
 async def test_random_traffic(dut):
     """random mix of every access, orderings, backpressure, host_mode, link
     errors and short layers, all against the model"""
@@ -501,8 +540,10 @@ async def test_random_traffic(dut):
                 await h.chk_write(h.b_addr(h.rng.randrange(4), h.rng.randrange(sa)), h.rng.getrandbits(32), **kw)
             else:
                 await h.chk_write(h.p_addr(h.rng.randrange(4), h.rng.randrange(2)), h.rng.getrandbits(32), **kw)
-        elif kind < 0.97:
+        elif kind < 0.96:
             await h.pulse_link_err()
+        elif kind < 0.97:
+            await h.pulse_dropped(h.rng.randint(1, 3))
         else:
             await h.chk_write(A_CTRL, 4 if h.rng.random() < 0.5 else 0)
         # the busy rules have their own test; here every access sees a settled
