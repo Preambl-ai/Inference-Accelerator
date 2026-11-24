@@ -5,7 +5,10 @@ end-to-end TB, so all three build programs the same way. Random int8 weights
 and activations only; no trained model.
 
 A network is a chain of layers on one running tensor:
-  conv    3x3 / 1x1, stride 1 or 2, any channel count
+  conv    3x3 / 1x1 (same padding), stride 1 or 2, any channel count
+  conv5   5x5, no padding (LeNet-5)
+  fc      a fully connected layer: a valid conv whose kernel is the whole
+          h x w input, so the output is 1x1 (LeNet's F5/F6/output)
   max2    2x2 max pool
   res     a ResNet basic block: conv3x3 -> conv3x3 -> add(skip), ReLU
   gavg    global average pool (only when h*w is a power of two), always last
@@ -68,8 +71,10 @@ class _Alloc:
 
 
 def build(rng, hw: HwParams, m_bits: int = 8, plan=None, h=8, w=8, c=None, read_latency=1,
-          desc_depth=32) -> Network:
-    """plan: list of 'conv3', 'conv1', 'conv3s2', 'max2', 'res', 'gavg'. None picks a random one."""
+          desc_depth=32, cout=None) -> Network:
+    """plan: list of 'conv3', 'conv1', 'conv3s2', 'conv5', 'fc', 'max2', 'res', 'gavg'.
+    None picks a random one. LENET and RESNET8 below are fixed plans. cout fixes
+    every conv's output channels (default: random 1..2N per conv)."""
     n = hw.n
     if hw.nbuf < 3:
         raise ValueError("networks with residual adds need NBUF >= 3")
@@ -86,12 +91,15 @@ def build(rng, hw: HwParams, m_bits: int = 8, plan=None, h=8, w=8, c=None, read_
     cur["base"] = al.act_region(0, h * w * words(c, n))
     net = Network([], [], [], (0, cur["base"], pack_act(x, n, zp)))
 
+    def width():
+        return want or cout or int(rng.integers(1, 2 * n + 1))
+
     def other(*banks):
         return next(b for b in range(hw.nbuf) if b not in banks)
 
-    def add_conv(k, stride, cout, relu=None, src=None):
+    def add_conv(k, stride, cout, relu=None, src=None, pad=None):
         s = src or cur
-        pad = k // 2
+        pad = k // 2 if pad is None else pad
         ho, wo = (s["h"] + 2 * pad - k) // stride + 1, (s["w"] + 2 * pad - k) // stride + 1
         cw_in, cw_out = words(s["c"], n), words(cout, n)
         K = k_of(k, k, cw_in, n)
@@ -111,10 +119,22 @@ def build(rng, hw: HwParams, m_bits: int = 8, plan=None, h=8, w=8, c=None, read_
         net.outputs.append((dst, dst_base, ho * wo * cw_out))
         return dict(bank=dst, base=dst_base, h=ho, w=wo, c=cout, zp=layer.zp_out)
 
-    for kind in plan:
+    for item in plan:
+        kind, _, w_s = item.partition(":")          # "conv5:6" fixes this conv's width
+        want = int(w_s) if w_s else None
         if kind in ("conv3", "conv1", "conv3s2"):
             k, st = (3, 1) if kind == "conv3" else (1, 1) if kind == "conv1" else (3, 2)
-            cur = add_conv(k, st, int(rng.integers(1, 2 * n + 1)))
+            cur = add_conv(k, st, width())
+            net.names.append(kind)
+        elif kind == "conv5":
+            if cur["h"] < 5 or cur["w"] < 5:
+                continue
+            cur = add_conv(5, 1, width(), pad=0)
+            net.names.append(kind)
+        elif kind == "fc":
+            if cur["h"] != cur["w"] or cur["h"] > 7:
+                raise ValueError(f"fc needs a square input of at most 7x7, got {cur['h']}x{cur['w']}")
+            cur = add_conv(cur["h"], 1, width(), pad=0)
             net.names.append(kind)
         elif kind == "max2":
             if cur["h"] < 2 or cur["w"] < 2:
@@ -181,6 +201,59 @@ def build(rng, hw: HwParams, m_bits: int = 8, plan=None, h=8, w=8, c=None, read_
     return net
 
 
+@dataclass
+class NetRun:
+    program: "P.ProgramResult"
+    outputs: List[list]             # words read back from every layer's output region
+    loads: int                      # load passes (1 = no reload)
+
+
+def images(hw: "P.HwInfo", net: Network) -> "P.MemImages":
+    return P.memory_images(hw, act=[net.input], b=net.b_images, p=net.p_images)
+
+
+def board_run(hw: "P.HwInfo", net: Network, first: int, stats):
+    """protocol sequence: load input, B and P (CRC checked), load the program
+    at descriptor `first` (CRC checked), run it once, then read every layer's
+    output region back. the host does nothing per layer."""
+    loads = yield from P.load(hw, images(hw, net), stats)
+    yield from P.load_program(net.descriptors, first, stats)
+    prog = yield from P.run_program(first, stats)
+    outs = []
+    for bank, base, count in net.outputs[:prog.layers_done]:
+        outs.append((yield from P.read_act(hw, bank, base, count, stats)))
+    return NetRun(prog, outs, loads)
+
+
+def compare(net: Network, run: NetRun):
+    """(ok, lines): every layer's words and cycle count against the model"""
+    e = net.expected
+    lines, ok = [], True
+    if run.program.err_code or run.program.layers_done != e.layers_done:
+        ok = False
+        lines.append(f"program: {run.program.layers_done} layers done, error "
+                     f"{run.program.err_code:#x} at descriptor {run.program.err_index}; model "
+                     f"{e.layers_done} layers, no error")
+    for i, name in enumerate(net.names[:run.program.layers_done]):
+        got, exp = run.outputs[i], e.outputs[i]
+        cyc, ecyc = run.program.cycles[i], e.cycles[i]
+        good = got == exp and cyc == ecyc
+        ok &= good
+        msg = f"layer {i:2d} {name:12s} {len(exp):5d} words  cycles {cyc:7d} (model {ecyc:7d})"
+        if got != exp:
+            bad = [j for j, (a, b) in enumerate(zip(got, exp)) if a != b] or [min(len(got), len(exp))]
+            msg += f"  {len(bad)} words differ, first at {bad[0]}"
+        lines.append(("ok   " if good else "FAIL ") + msg)
+    return ok, lines
+
+
+# fixed plans: LeNet-5 (32x32 input: C1 5x5, S2, C3 5x5, S4, F5 as a 5x5 fc,
+# F6 and the output as 1x1 fc) and a ResNet-8-style stack (stem, three basic
+# blocks with stride-2 downsampling convs between them, global average)
+LENET = ["conv5:6", "max2", "conv5:16", "max2", "fc:120", "fc:84", "fc:10"]
+RESNET8 = ["conv3:16", "res", "conv3s2:16", "res", "conv3s2:16", "res", "gavg"]
+
+
 if __name__ == "__main__":
     fails = 0
 
@@ -206,5 +279,22 @@ if __name__ == "__main__":
             regions = sorted((b, base, base + cnt) for b, base, cnt in net.outputs)
             chk(f"  output regions never overlap",
                 all(not (a[0] == b[0] and b[1] < a[2]) for a, b in zip(regions, regions[1:])))
+    for n in (2, 4, 8):
+        hw = HwParams(n=n, addr_width=12, nbuf=3, b_addr_w=13, p_addr_w=6 if n < 8 else 7)
+        rng = np.random.default_rng(10 + n)
+        hw = HwParams(n=n, addr_width=12, nbuf=3, b_addr_w=13, p_addr_w=8)   # the board's sizes
+        for name, plan, h in (("LeNet-5", LENET, 32), ("ResNet-8", RESNET8, 16)):
+            try:
+                net = build(rng, hw, plan=plan, h=h, w=h, c=3)
+            except MemoryError as e:
+                # B is 2^13 words of N bytes: LeNet-5's ~60 kB of weights need N=8
+                chk(f"N={n} {name} does not fit on chip ({e}): only expected below N=8", n < 8)
+                continue
+            e = net.expected
+            chk(f"N={n} {name} {net.names}: runs to END", e.err_index is None and
+                e.layers_done == len(net.outputs))
+            if name == "LeNet-5":
+                f = net.steps[-2].fields
+                chk(f"  LeNet-5 ends in a 1x1 output", (f["h_out"], f["w_out"]) == (1, 1))
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)
