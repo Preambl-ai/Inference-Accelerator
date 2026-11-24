@@ -100,6 +100,10 @@ module wdma #(
 
     localparam logic [3:0] E_DIM = 4'b0001, E_ALIGN = 4'b0010, E_RANGE = 4'b0100,
                            E_RESP = 4'b1000;
+    // range-check widths: wide enough for the pointer AND the count, so K
+    // never truncates (B_ADDR_W + 2 bits held K = 1024 as 0 when B_ADDR_W = 8)
+    localparam int RB_W = ((B_ADDR_W > K_WIDTH) ? B_ADDR_W : K_WIDTH) + 2;
+    localparam int RP_W = ((P_ADDR_W > 4) ? P_ADDR_W : 4) + 2;
 
     typedef enum logic [3:0] {S_IDLE, S_CHK, S_GRP, S_SEG, S_AR, S_R,
                               S_HW, S_HB, S_HAR, S_HR} state_t;
@@ -224,8 +228,8 @@ module wdma #(
                 S_GRP: begin
                     if (aborted || abort) begin
                         state <= S_IDLE;
-                    end else if ((B_ADDR_W+2)'(b_ptr) + (B_ADDR_W+2)'(k_q) > (B_ADDR_W+2)'(1) << B_ADDR_W ||
-                                 (P_ADDR_W+2)'(p_ptr) + (P_ADDR_W+2)'(N) > (P_ADDR_W+2)'(1) << P_ADDR_W) begin
+                    end else if (RB_W'(b_ptr) + RB_W'(k_q) > RB_W'(1) << B_ADDR_W ||
+                                 RP_W'(p_ptr) + RP_W'(N) > RP_W'(1) << P_ADDR_W) begin
                         f_err_code <= E_RANGE;
                         f_err      <= 1'b1;
                         state      <= S_IDLE;
