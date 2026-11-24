@@ -139,7 +139,10 @@ module wdma #(
     end
 
     assign f_ready = (state == S_IDLE);
-    assign busy    = (state != S_IDLE);
+    // busy covers the last B/P write too (it is registered, so it is on the
+    // port the cycle after the state goes idle): whoever muxes the write
+    // ports on busy keeps it
+    assign busy    = (state != S_IDLE) || b_we || p_we;
     assign arsize  = 3'd3;
     assign arburst = 2'b01;
     assign arid    = '0;

@@ -81,7 +81,7 @@ and the range checks are compares. DSP count: 0.
 | group | ports |
 | ----- | ----- |
 | fetch command | `f_start`, `f_b_src[AXI_AW-1:0]`, `f_p_src[AXI_AW-1:0]`, `f_k[K_WIDTH-1:0]`, `f_groups[CW_W-1:0]`, `f_b_dst[B_ADDR_W-1:0]`, `f_p_dst[P_ADDR_W-1:0]` |
-| fetch status | `f_ready`, `busy`, `f_done` (pulse), `f_err` (pulse), `f_err_code[3:0]` (held until the next start) |
+| fetch status | `f_ready`, `busy`, `f_done` (pulse), `f_err` (pulse), `f_err_code[3:0]` (held until the next start). `busy` also covers the cycle of the last (registered) B/P write, so a mux on `busy` keeps it |
 | host single beat | `h_req` (pulse, accepted only when `f_ready`), `h_we`, `h_addr[AXI_AW-1:0]` (4-byte aligned), `h_wdata[31:0]`, `h_ack` (pulse), `h_resp[1:0]` (the AXI response), `h_rdata[31:0]` |
 | abort | `abort` (pulse: soft reset) |
 | B/P write ports | `b_we`, `b_waddr`, `b_wdata[N*8-1:0]`, `p_we`, `p_waddr`, `p_wdata[52:0]` (the on-chip memories' host write ports; wdma drives them only while busy) |
