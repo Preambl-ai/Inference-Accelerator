@@ -109,6 +109,19 @@ against `fpga/reports/utilization.rpt`.
 | LUT | ~7-10 k | 20 800 | the bulk is requant (shift and clamp per channel), im2col (N-word slice buffer and its address logic), the systolic array's skew registers, the CSR read mux and its 64-bit CRC XOR trees |
 | FF | ~9 k | 41 600 | PE accumulators (64 x 32 b) and requant pipeline registers dominate |
 
+**Added by phase 1 (pooling).** These are estimates until you run Vivado.
+
+| block | DSP | BRAM36 | LUT | FF | notes |
+| ----- | --- | ------ | --- | -- | ----- |
+| pool_layer | 0 | 0 | ~0.7-0.9 k | ~0.5 k | No multipliers. Per lane at N=8: an 8-bit signed compare and a 24-bit adder with its rounding shifter. Bit-serial shift-and-add check phase. 24-bit lane accumulators (192 FF), a 64-bit write register, counters and pointers |
+| layer_engine | 0 | 0 | ~0.15 k | ~0.01 k | A 3:1 mux on the act_buffer read and write ports (64 b data + 12 b address), dispatch, and the bad-op flag |
+
+Running total at N=8: **DSP unchanged (~86-90)**, BRAM unchanged (~32),
+LUT ~8-11 k, FF ~9.5 k. The new timing paths are short: the pool compare
+and add sit between registers, and the owner mux sits in front of the BRAM
+ports, which the act_buffer read already crossed through conv_layer's host
+mux.
+
 **DSP is the resource that decides whether N=8 fits.** If utilization shows
 more than 90, or placement fails on DSPs, try these in order:
 1. **Cap synthesis:** `-tclargs 8 1 1 1000000 84`. This passes

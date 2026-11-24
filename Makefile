@@ -133,12 +133,16 @@ COMPILE_ARGS += -Pim2col_reader.READ_LATENCY=$(READ_LATENCY)
 SIM_BUILD = sim_build/im2col_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)
 endif
 
+# everything a conv layer is built from, below conv_layer / layer_engine
+CONV_SRCS  = $(PWD)/conv_layer/rtl/conv_core.sv
+CONV_SRCS += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
+CONV_SRCS += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
+CONV_SRCS += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+
 ifeq ($(MODULE_NAME),conv_layer)
-VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
-VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+VERILOG_SOURCES += $(CONV_SRCS)
 COMPILE_ARGS += -Pconv_layer.N=$(N)
 COMPILE_ARGS += -Pconv_layer.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pconv_layer.READ_LATENCY=$(READ_LATENCY)
@@ -162,12 +166,8 @@ endif
 
 ifeq ($(MODULE_NAME),top)
 VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/rtl/uart_tx.sv
-VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/conv_layer/rtl/conv_layer.sv
-VERILOG_SOURCES += $(PWD)/gemm_tile/rtl/gemm_tile.sv $(PWD)/im2col/rtl/im2col_reader.sv
-VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/ctrl_fsm.sv $(PWD)/systolic_array/rtl/systolic_array.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/pe.sv $(PWD)/systolic_array/rtl/delay.sv
-VERILOG_SOURCES += $(PWD)/systolic_array/rtl/requant.sv $(PWD)/axis/rtl/skid_buffer.sv
+VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/layer_engine/rtl/layer_engine.sv
+VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(CONV_SRCS)
 COMPILE_ARGS += -Ptop.N=$(N)
 COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
@@ -176,6 +176,26 @@ COMPILE_ARGS += -Ptop.CLKS_PER_BIT=$(CLKS_PER_BIT)
 COMPILE_ARGS += -Ptop.TIMEOUT_BITS=$(TIMEOUT_BITS)
 COMPILE_ARGS += -Ptop.HB_BIT=6
 SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)
+endif
+
+ifeq ($(MODULE_NAME),pool_harness)
+VERILOG_SOURCES += $(PWD)/pool/tb/pool_harness.sv $(PWD)/pool/rtl/pool_layer.sv
+VERILOG_SOURCES += $(PWD)/memory/rtl/act_buffer.sv $(PWD)/memory/rtl/bram.sv $(PWD)/systolic_array/rtl/delay.sv
+COMPILE_ARGS += -Ppool_harness.N=$(N)
+COMPILE_ARGS += -Ppool_harness.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Ppool_harness.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Ppool_harness.NBUF=$(CONV_NBUF)
+SIM_BUILD = sim_build/pool_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
+endif
+
+ifeq ($(MODULE_NAME),layer_engine)
+VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv
+VERILOG_SOURCES += $(CONV_SRCS)
+COMPILE_ARGS += -Player_engine.N=$(N)
+COMPILE_ARGS += -Player_engine.ADDR_WIDTH=$(ADDR_WIDTH)
+COMPILE_ARGS += -Player_engine.READ_LATENCY=$(READ_LATENCY)
+COMPILE_ARGS += -Player_engine.NBUF=$(CONV_NBUF)
+SIM_BUILD = sim_build/engine_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(CONV_NBUF)
 endif
 
 ifeq ($(MODULE_NAME),act_buffer)
@@ -194,7 +214,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top check-flow sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -374,9 +394,35 @@ sweep-top:
 	done
 	@echo "=== top sweep passed ==="
 
+# pool_layer on the real act_buffer. NBUF=3 leaves bank select 3 unused, so the
+# E_SEL "select >= NBUF" case runs there
+sweep-pool:
+	@for n in 1 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== pool N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=pool_harness N=$$n READ_LATENCY=$$rl ADDR_WIDTH=9 || exit 1; \
+	  done; \
+	done
+	@echo "=== pool N=4 READ_LATENCY=2 CONV_NBUF=3 (bank select 3 names no bank) ==="
+	@$(MAKE) -s MODULE_NAME=pool_harness N=4 READ_LATENCY=2 ADDR_WIDTH=9 CONV_NBUF=3 || exit 1
+	@echo "=== pool sweep passed ==="
+
+# layer_engine: conv and pool sharing one act_buffer. NBUF=3 runs the E_SEL
+# "select >= NBUF" cases and a third bank
+sweep-engine:
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== layer_engine N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=layer_engine N=$$n READ_LATENCY=$$rl ADDR_WIDTH=10 || exit 1; \
+	  done; \
+	done
+	@echo "=== layer_engine N=4 READ_LATENCY=2 CONV_NBUF=3 ==="
+	@$(MAKE) -s MODULE_NAME=layer_engine N=4 READ_LATENCY=2 ADDR_WIDTH=10 CONV_NBUF=3 || exit 1
+	@echo "=== layer_engine sweep passed ==="
+
 # fails if a sweep target is missing from sweep-all, or the Makefile lost its
 # trailing newline (how sweep-conv once got skipped without any failure)
 check-flow:
 	@python3 ci/check_flow.py Makefile
 
-sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine
