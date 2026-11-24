@@ -306,6 +306,16 @@ async def test_err_flags(dut):
     await h.run(P.write32(P.A_STATUS, P.ST_ERR, h.stats))
     assert not (await h.run(P.read32(P.A_STATUS, h.stats))) & P.ST_ERR
     await h.run_layer(good, "good layer after the errors", with_act=False)
+    # W1C one bit at a time against the real sticky bits: with done set,
+    # clearing err must leave done alone, and clearing done must clear it
+    # (clearing both at once cannot tell the bits apart; a mutation run
+    # showed the end-to-end test missing a swapped bit)
+    await h.run(P.write32(P.A_STATUS, P.ST_ERR, h.stats))
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert st & P.ST_DONE, f"W1C of err cleared done (STATUS {st:#x})"
+    await h.run(P.write32(P.A_STATUS, P.ST_DONE, h.stats))
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert not st & P.ST_DONE, f"W1C of done did not clear it (STATUS {st:#x})"
 
 
 @cocotb.test()

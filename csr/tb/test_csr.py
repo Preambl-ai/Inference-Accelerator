@@ -442,9 +442,15 @@ async def test_busy_rules(dut):
     """while busy: register reads, STATUS W1C and soft reset only"""
     h = await fresh(dut)
     sa = 1 << slot_shift(8 * h.n)
+    # stage the lower slot of an ACT, a B and a P word before the layer, so
+    # the top-slot writes below would commit if busy did not refuse them.
+    # without this the staging check refuses them too and hides a missing
+    # busy check (a mutation run showed it for B)
     await h.chk_write(A_CTRL, 4)
-    await h.chk_write(h.act_addr(0, 3, 0), 9)            # half-staged before the layer
+    await h.chk_write(h.act_addr(0, 3, 0), 9)
     await h.chk_write(A_CTRL, 0)
+    await h.chk_write(h.b_addr(1, 0), 9)
+    await h.chk_write(h.p_addr(1, 0), 9)
     h.next_layer = (100000, 0)
     await h.chk_write(A_CTRL, 1)
     assert h.busy
