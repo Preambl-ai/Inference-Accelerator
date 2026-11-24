@@ -203,7 +203,7 @@ DECERR. Refused accesses answer SLVERR and change nothing.
 | 0x04 | VERSION | RO | 0x0002_0000 | [31:16] major, [15:0] minor of this map. **2.0** adds the descriptor sequencer (PARAMS2, SEQ_*, DESC_WCRC, the DESC and CYC windows). Every 1.x register keeps its address and meaning, so a 1.x host (single layers) still works on a 2.0 board, and the host tells the two apart by the major |
 | 0x08 | PARAMS0 | RO | from parameters | [7:0] N, [11:8] READ_LATENCY, [19:12] ADDR_WIDTH, [23:20] NBUF, [31:24] B_ADDR_W |
 | 0x0C | PARAMS1 | RO | from parameters | [7:0] P_ADDR_W, [23:8] K_MAX |
-| 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses conv_layer `reset` for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets all three *_WCRC to 0xFFFF, reads 0 |
+| 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses the `reset` of layer_engine and (2.0) the sequencer for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets every *_WCRC (ACT, B, P and, 2.0, DESC) to 0xFFFF, reads 0 |
 | 0x14 | STATUS | RO / W1C | 0x2 | [0] busy, [1] ready, [2] done (sticky), [3] err (sticky), [4] host_mode, [5] DROPPED (sticky), [31:16] DROPPED_COUNT. Writing 1 to [2] or [3] clears it; start and soft reset also clear both. Writing 1 to [5] clears DROPPED and DROPPED_COUNT together; nothing else clears them except the board reset (they are link state, not layer state) |
 
 **DROPPED / DROPPED_COUNT.** The bridge pulses once for every byte that
@@ -354,10 +354,11 @@ so the host batches instead. fpga/README.md records this.
 
 ## 4. What the host may do while busy
 
-While `STATUS.busy = 1`, the only accepted accesses are:
-* register reads (all of 0x00 .. 0x88)
+While `STATUS.busy = 1` (a legacy layer or, 2.0, a program running), the
+only accepted accesses are:
+* register reads (all of 0x00 .. 0x9C)
 * a write of `CTRL.soft_reset`
-* W1C writes to STATUS
+* W1C writes to STATUS and (2.0) SEQ_STATUS
 
 Everything else is answered SLVERR and has **no effect**:
 * window reads and writes
@@ -391,8 +392,10 @@ layer can already be done, and done is cleared by the next start.
   for 16 cycles. A power-on counter (flops with an initial value, which 7-series
   configuration supports) holds `reset` for its first 16 cycles after
   configuration too. `reset` resets everything: UART, bridge, CSR (all
-  registers to the values above) and conv_layer. `CTRL.soft_reset` resets
-  only conv_layer plus STATUS.done/err and CYCLES. It **never** resets the UART,
+  registers to the values above), layer_engine and the sequencer.
+  `CTRL.soft_reset` resets only layer_engine, the sequencer (2.0: a running
+  program stops; the descriptor RAM keeps its contents) plus STATUS.done/err,
+  SEQ_STATUS.done/err and CYCLES. It **never** resets the UART,
   the bridge, the CSR's bus logic, the command registers, host_mode,
   LAUNCH_COUNT or the write CRCs. The bus is in the middle of answering the
   very write that asked for it, and the host needs LAUNCH_COUNT to survive.
