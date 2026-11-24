@@ -59,6 +59,8 @@ module csr #(
 
     // from the bridge: any CRC / timeout / opcode error
     input  logic link_err,
+    // from the bridge: a byte arrived while an answer was going out
+    input  logic link_dropped,
 
     // to and from conv_layer
     output logic conv_soft_reset,
@@ -177,6 +179,10 @@ module csr #(
     logic [31:0] cmd [0:NCMD-1];
     logic [31:0] scratch, cycles, launch_count;
     logic [15:0] act_wcrc, b_wcrc, p_wcrc;
+    // bytes the bridge dropped mid-answer: sticky flag and a count that
+    // saturates at 0xFFFF instead of wrapping back to a harmless-looking 0
+    logic        dropped_sticky;
+    logic [15:0] dropped_count;
     logic        busy;
     assign busy = conv_busy;
 
@@ -290,7 +296,8 @@ module csr #(
             A_PARAMS0:  return {1'b1, {8'(B_ADDR_W), 4'(NBUF), 8'(ADDR_WIDTH), 4'(READ_LATENCY), 8'(N)}};
             A_PARAMS1:  return {1'b1, {8'h0, 16'(K_MAX), 8'(P_ADDR_W)}};
             A_CTRL:     return {1'b1, {29'h0, host_mode, 2'b00}};
-            A_STATUS:   return {1'b1, {27'h0, host_mode, err_sticky, done_sticky, conv_ready, conv_busy}};
+            A_STATUS:   return {1'b1, {dropped_count, 10'h0, dropped_sticky, host_mode, err_sticky,
+                                       done_sticky, conv_ready, conv_busy}};
             A_ERR_CODE: return {1'b1, {23'h0, conv_err_code}};
             A_CYCLES:   return {1'b1, cycles};
             A_SCRATCH:  return {1'b1, scratch};
@@ -332,6 +339,7 @@ module csr #(
             act_wcrc <= 16'hFFFF; b_wcrc <= 16'hFFFF; p_wcrc <= 16'hFFFF;
             host_mode <= 1'b0; conv_start <= 1'b0; conv_soft_reset <= 1'b0;
             done_sticky <= 1'b0; err_sticky <= 1'b0;
+            dropped_sticky <= 1'b0; dropped_count <= '0;
             host_we <= 1'b0; host_waddr <= '0; host_wdata <= '0; host_wr_sel <= '0;
             b_we <= 1'b0; b_waddr <= '0; b_wdata <= '0;
             p_we <= 1'b0; p_waddr <= '0; p_wdata <= '0;
@@ -362,6 +370,14 @@ module csr #(
                 if (busy)      cycles      <= cycles + 1'b1;
                 if (conv_done) done_sticky <= 1'b1;
                 if (conv_err)  err_sticky  <= 1'b1;
+            end
+
+            // link state, not layer state: start and soft reset leave it
+            // alone; only W1C (below, which wins on the same edge) and the
+            // board reset clear it
+            if (link_dropped) begin
+                dropped_sticky <= 1'b1;
+                if (dropped_count != 16'hFFFF) dropped_count <= dropped_count + 1'b1;
             end
 
             // ---------------- write channel ----------------
@@ -395,6 +411,10 @@ module csr #(
                             // W1C, allowed while busy
                             if (w_q[2]) done_sticky <= 1'b0;
                             if (w_q[3]) err_sticky  <= 1'b0;
+                            if (w_q[5]) begin
+                                dropped_sticky <= 1'b0;
+                                dropped_count  <= '0;
+                            end
                         end else if (w_off == A_SCRATCH) begin
                             if (busy) s_bresp <= 2'b10;
                             else      scratch <= w_q;

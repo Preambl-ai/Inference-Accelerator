@@ -17,12 +17,27 @@
 // lands on top of an unconsumed one.
 //
 // timeout: TIMEOUT_BITS bit times without a byte in the middle of a packet
-// discards it and answers 0x06. after any error answer the bridge drains:
-// it drops bytes until the line has been quiet for the same timeout, so the
-// tail of a broken packet is never parsed as a new one.
+// discards it and answers 0x06 (the line is already quiet, so at once).
+//
+// every other link error (HCRC, DCRC, bad opcode/LEN) is decided while the
+// host may still be sending the rest of its packet: a bad header is known
+// after 9 bytes of what can be a 1 KB burst. so the bridge drains FIRST -- it
+// drops bytes until the line has been quiet for the same timeout -- and only
+// then answers. the answer never talks over the host's own packet, and the
+// tail of a broken packet is never parsed as a new one. (answering first,
+// then draining, put the tail of the host's packet inside the answer, where
+// STATUS.DROPPED counted it as a host fault; the first DROPPED test run
+// showed exactly that.)
 //
 // link_err pulses on every HCRC / DCRC / opcode / timeout error; the CSR uses
 // it to clear its half-staged wide words.
+//
+// rx_dropped pulses for every byte that arrives while an answer is going out
+// (the host must wait for the answer first, so such a byte is a host-side
+// protocol fault). the byte is still dropped, but the CSR counts it
+// (STATUS.DROPPED) so the fault is visible instead of surfacing later as a
+// mysterious CRC error or timeout. bytes thrown away while draining after an
+// error are expected and not counted.
 
 module uart_bridge #(
     parameter int CLKS_PER_BIT = 100,
@@ -41,6 +56,7 @@ module uart_bridge #(
     input  logic       tx_ready,
 
     output logic       link_err,
+    output logic       rx_dropped,       // a byte arrived mid-answer and was dropped
 
     // AXI4-Lite master
     output logic [ADDR_W-1:0] m_awaddr,
@@ -106,7 +122,7 @@ module uart_bridge #(
     logic [31:0] word;
     logic [7:0]  status;
     logic        stopped;                // a bus error stopped the burst
-    logic        drain_after;            // drain once the answer is out
+    logic        answer_pending;         // draining; the decided answer goes out after
     logic        is_read;
 
     logic aw_done, w_done, ar_done;
@@ -152,13 +168,18 @@ module uart_bridge #(
     logic tx_go;
     assign tx_go = tx_valid && tx_ready;
 
-    // a response with no data: straight to the status byte after the sync
+    // a response with no data: straight to the status byte after the sync.
+    // with drain set, the line is drained first and the answer follows.
     task automatic answer(input logic [7:0] st, input logic drain, input logic err);
-        status      <= st;
-        drain_after <= drain;
-        is_read     <= 1'b0;
-        link_err    <= err;
-        state       <= S_R_SYNC;
+        status   <= st;
+        is_read  <= 1'b0;
+        link_err <= err;
+        if (drain) begin
+            answer_pending <= 1'b1;
+            state          <= S_DRAIN;
+        end else begin
+            state <= S_R_SYNC;
+        end
     endtask
 
     always_ff @(posedge clk) begin
@@ -168,6 +189,7 @@ module uart_bridge #(
             byte_q      <= '0;
             idle_cnt    <= '0;
             link_err    <= 1'b0;
+            rx_dropped  <= 1'b0;
             m_awvalid   <= 1'b0;
             m_wvalid    <= 1'b0;
             m_arvalid   <= 1'b0;
@@ -186,10 +208,11 @@ module uart_bridge #(
             word        <= '0;
             status      <= ST_OK;
             stopped     <= 1'b0;
-            drain_after <= 1'b0;
+            answer_pending <= 1'b0;
             is_read     <= 1'b0;
         end else begin
-            link_err <= 1'b0;
+            link_err   <= 1'b0;
+            rx_dropped <= rx_valid && answering;
 
             // holding register and the idle timer
             if (rx_valid) begin
@@ -254,7 +277,6 @@ module uart_bridge #(
                             crc      <= 16'hFFFF;     // DCRC, or the response CRC for reads
                             if (op == OP_RD || op == OP_BRD) begin
                                 is_read     <= 1'b1;
-                                drain_after <= 1'b0;
                                 state       <= S_R_SYNC;
                             end else begin
                                 state <= S_DATA;
@@ -394,11 +416,19 @@ module uart_bridge #(
 
                 S_R_STATUS: if (tx_go) begin crc <= crc16_byte(crc, status); state <= S_R_CRC0; end
                 S_R_CRC0:   if (tx_go) state <= S_R_CRC1;
-                S_R_CRC1:   if (tx_go) begin if (drain_after) state <= S_DRAIN; else state <= S_SYNC; end
+                S_R_CRC1:   if (tx_go) state <= S_SYNC;
 
-                // drop everything until the line has been quiet for the timeout
+                // drop everything until the line has been quiet for the
+                // timeout, then send the answer that was decided on entry
                 S_DRAIN: begin
-                    if (timed_out && !have_byte && !rx_valid) state <= S_SYNC;
+                    if (timed_out && !have_byte && !rx_valid) begin
+                        if (answer_pending) begin
+                            answer_pending <= 1'b0;
+                            state          <= S_R_SYNC;
+                        end else begin
+                            state <= S_SYNC;
+                        end
+                    end
                 end
 
                 default: state <= S_SYNC;

@@ -306,6 +306,16 @@ async def test_err_flags(dut):
     await h.run(P.write32(P.A_STATUS, P.ST_ERR, h.stats))
     assert not (await h.run(P.read32(P.A_STATUS, h.stats))) & P.ST_ERR
     await h.run_layer(good, "good layer after the errors", with_act=False)
+    # W1C one bit at a time against the real sticky bits: with done set,
+    # clearing err must leave done alone, and clearing done must clear it
+    # (clearing both at once cannot tell the bits apart; a mutation run
+    # showed the end-to-end test missing a swapped bit)
+    await h.run(P.write32(P.A_STATUS, P.ST_ERR, h.stats))
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert st & P.ST_DONE, f"W1C of err cleared done (STATUS {st:#x})"
+    await h.run(P.write32(P.A_STATUS, P.ST_DONE, h.stats))
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert not st & P.ST_DONE, f"W1C of done did not clear it (STATUS {st:#x})"
 
 
 @cocotb.test()
@@ -390,6 +400,127 @@ async def test_link_errors(dut):
     assert st == P.ST_DECERR
     st, words = await h.raw(P.pkt_burst_read(P.B_BASE, 3), 3)
     assert st == P.ST_SLVERR and words == [0, 0, 0]
+    # every error above was the host's packet going wrong, never the host
+    # talking over an answer: the bridge must drain before it answers, so
+    # none of those packets' tails may have been counted as DROPPED
+    st = await h.run(P.check_dropped(h.stats))
+    assert P.dropped_count(st) == 0, "an error answer overlapped the rest of the host's packet"
+
+
+@cocotb.test()
+async def test_bus_errors_and_refusals(dut):
+    """the error paths end to end, against the real conv_layer and act_buffer:
+    a bus error stops a burst at that word (writes after it never happen,
+    reads after it are zeros); ACT reads are refused in host mode and ACT
+    writes outside it; a P word's top slot without its staged lower slot is
+    refused and commits nothing"""
+    h = await fresh(dut)
+    # -- writes: a refused word stops the burst. SCRATCH (ok), then BUILD_ID
+    # (read only: SLVERR), ... up to H_IN at 0x40, which must stay untouched
+    await h.run(P.write_command(dict.fromkeys(P.CMD_FIELDS, 1), h.stats))
+    st, _ = await h.raw(P.pkt_burst_write(P.A_SCRATCH, [0x5C5C] + [0xEE] * 8))
+    assert st == P.ST_SLVERR, f"burst over a read-only register: {P.STATUS_NAMES.get(st, st)}"
+    assert await h.run(P.read32(P.A_SCRATCH, h.stats)) == 0x5C5C, "the word before the error was lost"
+    assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1, "a burst kept writing after SLVERR"
+    # unmapped first word (0x38): DECERR, and H_IN/W_IN two words on stay untouched
+    st, _ = await h.raw(P.pkt_burst_write(0x38, [7, 7, 9, 9]))
+    assert st == P.ST_DECERR
+    assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1 and \
+        await h.run(P.read32(P.A_CMD0 + 4, h.stats)) == 1, "a burst kept writing after DECERR"
+    # -- reads: LAUNCH_COUNT (ok), 0x38 (DECERR), 0x3C, H_IN: zeros from the error on
+    launches = await h.run(P.read32(P.A_LAUNCH, h.stats))
+    st, words = await h.raw(P.pkt_burst_read(P.A_LAUNCH, 4), 4)
+    assert (st, words) == (P.ST_DECERR, [launches, 0, 0, 0]), \
+        f"DECERR mid burst read: {P.STATUS_NAMES.get(st, st)} {words}"
+    # -- ACT refusals by host_mode, on the real act_buffer
+    word = [int(h.rng.integers(0, 1 << (8 * h.n)))]
+    st, _ = await h.raw(P.pkt_burst_write(h.hw.act_addr(1, 3), word))
+    assert st == P.ST_SLVERR, "ACT write without host_mode was accepted"
+    await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
+    await h.run(P.burst_write(h.hw.act_addr(1, 3), word, h.stats))
+    st, words = await h.raw(P.pkt_burst_read(h.hw.act_addr(1, 3), 1), 1)
+    assert (st, words) == (P.ST_SLVERR, [0]), "ACT read in host mode was accepted (reads are frozen then)"
+    await h.run(P.write32(P.A_CTRL, 0, h.stats))
+    got = await h.run(P.read_act(h.hw, 1, 3, 1, h.stats))
+    assert got == word, "the ACT word written in host mode did not read back"
+    # -- stale partial commit on the real P memory: the layer would use the
+    # wrong parameters, so check by running one. a good P word first...
+    layer = small_layer(h, kh=1, kw=1, stride=1, pad=0, h_in=1, w_in=h.n, cin=h.n, cout=h.n,
+                        p_base=0)
+    await h.run_layer(layer, "reference layer", check_banks=False)
+    # ...then a top slot on its own, and a top slot for a different word than
+    # the one staged: both refused. 0x1F_FFFF in the top slot is shift = 31,
+    # mult = 0xFFFF, which would change channel 0's output if it landed
+    st, _ = await h.raw(P.pkt_write32(h.hw.p_addr(0, 1), 0x1F_FFFF))
+    assert st == P.ST_SLVERR, "P top slot alone was committed"
+    st1, _ = await h.raw(P.pkt_write32(h.hw.p_addr(1, 0), 0xFFFFFFFF))
+    st2, _ = await h.raw(P.pkt_write32(h.hw.p_addr(0, 1), 0x1F_FFFF))
+    assert (st1, st2) == (P.ST_OK, P.ST_SLVERR), "P top slot committed with another word's staged slot"
+    # rerun WITHOUT reloading P: the output only matches if P word 0 is untouched
+    cmd = layer.command(h.n)
+    await h.run(P.start(h.stats))
+    st, _ = await h.run(P.poll_done(h.stats))
+    exp = expected(layer, h.n)
+    out = await h.run(P.read_act(h.hw, cmd["dst_sel"], cmd["dst_base"], len(exp), h.stats))
+    assert st & P.ST_DONE and out == exp, "a refused P write changed the parameters"
+
+
+@cocotb.test()
+async def test_dropped_bytes_mid_answer(dut):
+    """bytes sent while the board is answering are dropped, but counted:
+    STATUS.DROPPED and DROPPED_COUNT show exactly how many, the answer itself
+    is intact, and the host reports a protocol fault instead of retrying"""
+    h = await fresh(dut)
+    t, clk = h.t, dut.CLK100MHZ
+    st = await h.run(P.check_dropped(h.stats))
+    assert not st & P.ST_DROPPED, "DROPPED set on a clean link"
+    words_in = [int(v) for v in h.rng.integers(0, 1 << (8 * h.n), 64)]
+    await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
+    await h.run(P.burst_write(h.hw.act_addr(0, 0), words_in, h.stats))
+    await h.run(P.write32(P.A_CTRL, 0, h.stats))
+    # a long answer (64 words), and 6 bytes sent into the middle of it; the
+    # bytes look like the start of a packet, so a parser that took them would
+    # be visibly derailed
+    pkt = P.pkt_burst_read(h.hw.act_addr(0, 0), 64)
+    want = P.response_len(64)
+    extra = bytes((0xA5, P.OP_WRITE32, 0x20, 0, 0, 0))
+    t.rx.clear()
+    await t.send(pkt)
+    while len(t.rx) < 3:
+        await ClockCycles(clk, 4 * h.cpb)
+    await t.send(extra)
+    assert len(t.rx) < want - 8, "the extra bytes did not land inside the answer"
+    while len(t.rx) < want:
+        await ClockCycles(clk, 4 * h.cpb)
+    status, words = P.parse_response(bytes(b for b, _ in t.rx[:want]), 64)
+    assert (status, words) == (P.ST_OK, words_in), "the answer was disturbed by the dropped bytes"
+    await t.wait_idle()
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert st & P.ST_DROPPED and P.dropped_count(st) == len(extra), \
+        f"STATUS {st:#x}: expected DROPPED with count {len(extra)}"
+    # the host side: any check is a ProtocolFault carrying the count...
+    try:
+        await h.run(P.check_dropped(h.stats))
+        assert False, "check_dropped did not raise"
+    except P.ProtocolFault as e:
+        assert e.count == len(extra)
+    # ...and so is a failed exchange: the host probes STATUS before retrying
+    # and stops, instead of retrying into a string of CRC errors
+    packets = h.stats.packets
+    first = t.packets + 1               # corrupt only this write, not the STATUS probe after it
+    h.t.inject = lambda k, b: b[:10] + bytes((b[10] ^ 1,)) + b[11:] if k == first else b
+    try:
+        await h.run(P.write32(P.A_SCRATCH, 1, h.stats))
+        assert False, "a failed exchange with DROPPED set was retried"
+    except P.ProtocolFault as e:
+        assert e.count == len(extra) and h.stats.packets == packets + 1
+    h.t.inject = None
+    # W1C clears flag and count together; the link is then clean again
+    await h.run(P.write32(P.A_STATUS, P.ST_DROPPED, h.stats))
+    st = await h.run(P.check_dropped(h.stats))
+    assert P.dropped_count(st) == 0
+    dut._log.info(f"{len(extra)} bytes sent mid-answer: answer intact, DROPPED_COUNT={len(extra)}, "
+                  f"host raised ProtocolFault")
 
 
 @cocotb.test()

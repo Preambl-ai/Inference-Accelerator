@@ -138,7 +138,12 @@ CMD_FIELDS = ("h_in", "w_in", "h_out", "w_out", "cin_words", "cout_words", "kh",
               "src_base", "dst_base", "b_base", "p_base")
 
 CTRL_START, CTRL_SOFT_RESET, CTRL_HOST_MODE, CTRL_CLEAR_WCRC = 1, 2, 4, 8
-ST_BUSY, ST_READY, ST_DONE, ST_ERR, ST_HOSTMODE = 1, 2, 4, 8, 16
+ST_BUSY, ST_READY, ST_DONE, ST_ERR, ST_HOSTMODE, ST_DROPPED = 1, 2, 4, 8, 16, 32
+
+
+def dropped_count(status_word: int) -> int:
+    """STATUS[31:16]: bytes the bridge dropped mid-answer (saturates at 0xFFFF)"""
+    return status_word >> 16
 
 ACT_BASE, B_BASE, P_BASE = 0x100000, 0x200000, 0x300000
 P_WIDTH = 53
@@ -215,6 +220,18 @@ class LinkError(Exception):
     """the link failed RETRIES times in a row"""
 
 
+class ProtocolFault(Exception):
+    """the board dropped bytes that arrived while it was answering. correct
+    host code never sends before the answer is in, so this is a bug on the
+    host side (or a second program on the port), not a noisy link, and
+    retrying would only hide it"""
+
+    def __init__(self, count):
+        super().__init__(f"the board dropped {count} byte(s) sent while it was answering "
+                         f"(STATUS.DROPPED): the host sent before reading the whole answer")
+        self.count = count
+
+
 class BusError(Exception):
     """the CSR answered SLVERR or DECERR"""
 
@@ -258,13 +275,29 @@ class LinkStats:
     statuses: Dict[int, int] = field(default_factory=dict)
     protocol_errors: int = 0
     reloads: int = 0
+    stale_dropped: int = 0       # DROPPED count found (and cleared) at connect
 
     def saw(self, status):
         self.statuses[status] = self.statuses.get(status, 0) + 1
 
 
+def _probe_dropped():
+    """after a failed exchange: did the board drop bytes we sent mid-answer?
+    one plain read of STATUS, no retry; raises ProtocolFault if so"""
+    raw = yield Xfer(pkt_read32(A_STATUS), response_len(1))
+    try:
+        status, words = parse_response(raw, 1)
+    except ProtocolError:
+        return
+    if status == ST_OK and words[0] & ST_DROPPED:
+        raise ProtocolFault(dropped_count(words[0]))
+
+
 def transact(packet: bytes, read_words: int, stats: LinkStats, retry: bool = True):
-    """one packet with retries on link errors. returns (status, words)"""
+    """one packet with retries on link errors. returns (status, words).
+    before each retry the host asks the board whether it dropped bytes: a
+    garbled or missing answer caused by the host talking over the board is a
+    ProtocolFault, not something to retry."""
     for attempt in range(RETRIES if retry else 1):
         stats.packets += 1
         raw = yield Xfer(packet, response_len(read_words))
@@ -273,11 +306,13 @@ def transact(packet: bytes, read_words: int, stats: LinkStats, retry: bool = Tru
         except ProtocolError:
             stats.protocol_errors += 1
             yield WaitIdle()
+            yield from _probe_dropped()
             stats.retries += 1
             continue
         stats.saw(status)
         if status in LINK_ERRORS:
             yield WaitIdle()            # the bridge drains until the line is quiet
+            yield from _probe_dropped()
             stats.retries += 1
             continue
         return status, words
@@ -337,7 +372,21 @@ def identify(stats):
     p0 = yield from read32(A_PARAMS0, stats)
     p1 = yield from read32(A_PARAMS1, stats)
     build = yield from read32(A_BUILD_ID, stats)
+    # a DROPPED count left over from an earlier session is history: report it
+    # (stats.stale_dropped) and clear it, so any count from now on is ours
+    st = yield from read32(A_STATUS, stats)
+    if st & ST_DROPPED:
+        stats.stale_dropped = dropped_count(st)
+        yield from write32(A_STATUS, ST_DROPPED, stats)
     return HwInfo.decode(p0, p1), build
+
+
+def check_dropped(stats):
+    """raise ProtocolFault if the board has dropped any byte since connect"""
+    st = yield from read32(A_STATUS, stats)
+    if st & ST_DROPPED:
+        raise ProtocolFault(dropped_count(st))
+    return st
 
 
 @dataclass
@@ -436,6 +485,8 @@ def poll_done(stats, max_polls: int = 100000):
     """STATUS until done or err. returns (status word, polls)"""
     for i in range(max_polls):
         st = yield from read32(A_STATUS, stats)
+        if st & ST_DROPPED:
+            raise ProtocolFault(dropped_count(st))
         if st & (ST_DONE | ST_ERR):
             return st, i + 1
     raise RuntimeError("layer did not finish")
@@ -469,6 +520,7 @@ def run_layer(hw: HwInfo, cmd: dict, images: MemImages, out_count: int, stats):
     out = []
     if out_count and st & ST_DONE:
         out = yield from read_act(hw, cmd["dst_sel"], cmd["dst_base"], out_count, stats)
+    yield from check_dropped(stats)     # a clean run leaves DROPPED at 0
     return LayerResult(st, err_code, cycles, out, polls)
 
 
@@ -528,11 +580,23 @@ if __name__ == "__main__":
         def xfer(self, pkt, n): self.sent.append(pkt); return self.answers.pop(0)
         def wait_idle(self): self.idles += 1
 
+    # every failed exchange is followed by one STATUS probe for DROPPED
+    clean = build_response(ST_OK, [ST_READY])
+    probe = pkt_read32(A_STATUS)
     st = LinkStats()
-    t = Scripted([build_response(ST_DCRC), None, build_response(ST_OK)])
+    t = Scripted([build_response(ST_DCRC), clean, None, clean, build_response(ST_OK)])
     run_sync(write32(A_SCRATCH, 5, st), t)
-    chk("retry after DCRC and a lost answer", (len(t.sent), t.idles, st.retries), (3, 2, 2))
-    chk("retries resend identical bytes", len(set(t.sent)), 1)
+    writes = [p for p in t.sent if p != probe]
+    chk("retry after DCRC and a lost answer", (len(writes), t.sent.count(probe), t.idles, st.retries),
+        (3, 2, 2, 2))
+    chk("retries resend identical bytes", len(set(writes)), 1)
+    # the board dropped bytes: a protocol fault, not another retry
+    st = LinkStats()
+    t = Scripted([None, build_response(ST_OK, [(3 << 16) | ST_DROPPED | ST_READY])])
+    try:
+        run_sync(write32(A_SCRATCH, 5, st), t); chk("DROPPED raises ProtocolFault", False, True)
+    except ProtocolFault as e:
+        chk("DROPPED raises ProtocolFault with the count, no retry", (e.count, len(t.sent)), (3, 2))
     st = LinkStats()
     t = Scripted([build_response(ST_SLVERR)])
     try:
@@ -541,12 +605,13 @@ if __name__ == "__main__":
         chk("SLVERR raises, no retry", len(t.sent), 1)
     # start: answer lost but LAUNCH_COUNT moved -> no second start
     st = LinkStats()
-    t = Scripted([build_response(ST_OK, [5]), None, build_response(ST_OK, [6])])
+    t = Scripted([build_response(ST_OK, [5]), None, clean, build_response(ST_OK, [6])])
     run_sync(start(st), t)
     starts = sum(1 for pkt in t.sent if pkt == pkt_write32(A_CTRL, CTRL_START))
     chk("start not repeated when LAUNCH_COUNT moved", starts, 1)
     st = LinkStats()
-    t = Scripted([build_response(ST_OK, [5]), None, build_response(ST_OK, [5]), build_response(ST_OK)])
+    t = Scripted([build_response(ST_OK, [5]), None, clean, build_response(ST_OK, [5]),
+                  build_response(ST_OK)])
     run_sync(start(st), t)
     starts = sum(1 for pkt in t.sent if pkt == pkt_write32(A_CTRL, CTRL_START))
     chk("start repeated when LAUNCH_COUNT did not move", starts, 2)
