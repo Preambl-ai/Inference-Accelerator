@@ -393,6 +393,64 @@ async def test_link_errors(dut):
 
 
 @cocotb.test()
+async def test_bus_errors_and_refusals(dut):
+    """the error paths end to end, against the real conv_layer and act_buffer:
+    a bus error stops a burst at that word (writes after it never happen,
+    reads after it are zeros); ACT reads are refused in host mode and ACT
+    writes outside it; a P word's top slot without its staged lower slot is
+    refused and commits nothing"""
+    h = await fresh(dut)
+    # -- writes: a refused word stops the burst. SCRATCH (ok), then BUILD_ID
+    # (read only: SLVERR), ... up to H_IN at 0x40, which must stay untouched
+    await h.run(P.write_command(dict.fromkeys(P.CMD_FIELDS, 1), h.stats))
+    st, _ = await h.raw(P.pkt_burst_write(P.A_SCRATCH, [0x5C5C] + [0xEE] * 8))
+    assert st == P.ST_SLVERR, f"burst over a read-only register: {P.STATUS_NAMES.get(st, st)}"
+    assert await h.run(P.read32(P.A_SCRATCH, h.stats)) == 0x5C5C, "the word before the error was lost"
+    assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1, "a burst kept writing after SLVERR"
+    # unmapped first word (0x38): DECERR, and H_IN/W_IN two words on stay untouched
+    st, _ = await h.raw(P.pkt_burst_write(0x38, [7, 7, 9, 9]))
+    assert st == P.ST_DECERR
+    assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1 and \
+        await h.run(P.read32(P.A_CMD0 + 4, h.stats)) == 1, "a burst kept writing after DECERR"
+    # -- reads: LAUNCH_COUNT (ok), 0x38 (DECERR), 0x3C, H_IN: zeros from the error on
+    launches = await h.run(P.read32(P.A_LAUNCH, h.stats))
+    st, words = await h.raw(P.pkt_burst_read(P.A_LAUNCH, 4), 4)
+    assert (st, words) == (P.ST_DECERR, [launches, 0, 0, 0]), \
+        f"DECERR mid burst read: {P.STATUS_NAMES.get(st, st)} {words}"
+    # -- ACT refusals by host_mode, on the real act_buffer
+    word = [int(h.rng.integers(0, 1 << (8 * h.n)))]
+    st, _ = await h.raw(P.pkt_burst_write(h.hw.act_addr(1, 3), word))
+    assert st == P.ST_SLVERR, "ACT write without host_mode was accepted"
+    await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
+    await h.run(P.burst_write(h.hw.act_addr(1, 3), word, h.stats))
+    st, words = await h.raw(P.pkt_burst_read(h.hw.act_addr(1, 3), 1), 1)
+    assert (st, words) == (P.ST_SLVERR, [0]), "ACT read in host mode was accepted (reads are frozen then)"
+    await h.run(P.write32(P.A_CTRL, 0, h.stats))
+    got = await h.run(P.read_act(h.hw, 1, 3, 1, h.stats))
+    assert got == word, "the ACT word written in host mode did not read back"
+    # -- stale partial commit on the real P memory: the layer would use the
+    # wrong parameters, so check by running one. a good P word first...
+    layer = small_layer(h, kh=1, kw=1, stride=1, pad=0, h_in=1, w_in=h.n, cin=h.n, cout=h.n,
+                        p_base=0)
+    await h.run_layer(layer, "reference layer", check_banks=False)
+    # ...then a top slot on its own, and a top slot for a different word than
+    # the one staged: both refused. 0x1F_FFFF in the top slot is shift = 31,
+    # mult = 0xFFFF, which would change channel 0's output if it landed
+    st, _ = await h.raw(P.pkt_write32(h.hw.p_addr(0, 1), 0x1F_FFFF))
+    assert st == P.ST_SLVERR, "P top slot alone was committed"
+    st1, _ = await h.raw(P.pkt_write32(h.hw.p_addr(1, 0), 0xFFFFFFFF))
+    st2, _ = await h.raw(P.pkt_write32(h.hw.p_addr(0, 1), 0x1F_FFFF))
+    assert (st1, st2) == (P.ST_OK, P.ST_SLVERR), "P top slot committed with another word's staged slot"
+    # rerun WITHOUT reloading P: the output only matches if P word 0 is untouched
+    cmd = layer.command(h.n)
+    await h.run(P.start(h.stats))
+    st, _ = await h.run(P.poll_done(h.stats))
+    exp = expected(layer, h.n)
+    out = await h.run(P.read_act(h.hw, cmd["dst_sel"], cmd["dst_base"], len(exp), h.stats))
+    assert st & P.ST_DONE and out == exp, "a refused P write changed the parameters"
+
+
+@cocotb.test()
 async def test_dropped_bytes_mid_answer(dut):
     """bytes sent while the board is answering are dropped, but counted:
     STATUS.DROPPED and DROPPED_COUNT show exactly how many, the answer itself
