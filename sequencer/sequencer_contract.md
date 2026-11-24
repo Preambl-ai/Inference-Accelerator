@@ -63,6 +63,26 @@ B_ADDR_W, P_ADDR_W, M_BITS), exactly as the CSR command registers are.
 `host/protocol.py` builds these words (`pack_descriptor`); the TB and
 `run_network.py` use that one packer.
 
+### 4. Where the weights of a whole program live (and P_ADDR_W)
+
+A program keeps every layer's B and P resident at once, since the host does
+nothing between layers. P holds one 53-bit requant entry per output channel
+(rounded up to N) of every conv in the program, so the board's P_ADDR_W = 6
+(64 entries) caps a program at 64 output channels in total: not even a narrow
+ResNet-8 (9 convs x 16 = 144).
+
+| | keep P_ADDR_W = 6, stream P per layer from the host | **P_ADDR_W = 8 (256 entries, chosen)** |
+| --- | --- | --- |
+| cost | none in RTL; the host works per layer, which the goal forbids | 256 x 53 b = one BRAM36 (64 x 53 b was LUTRAM) |
+| fits on chip | 64 channels | LeNet-5 (6+16+120+84+10 -> 248 at N=8), ResNet-8 at width 16 (144) |
+| ceiling | - | the descriptor's p_base field is 8 bits, so 8 is the most without a format change |
+
+**Chosen: P_ADDR_W = 8 in top.** B (8192 words of N bytes, 64 kB at N=8) is
+then the limit: LeNet-5's weights (~8100 words at N=8) just fit, ResNet-8/20
+at their usual widths (16/32/64) do not. Those are what phase 4's DMA is for:
+B and P come from DDR per output group, and the on-chip B/P become a cache
+of one layer.
+
 ## Ports
 
 | group | ports |
@@ -106,4 +126,24 @@ B_ADDR_W, P_ADDR_W, M_BITS), exactly as the CSR command registers are.
 
 ## Measured (filled in from simulation)
 
-    TBD
+From `sequencer/tb/test_seq_harness.py` (sweep-seq: N = 2, 4, 8 x
+READ_LATENCY = 1, 2, plus DESC_DEPTH = 16), asserted on every program that
+reaches END:
+
+    start to done = sum(layer cycles) + layers * (20 + READ_LATENCY) + 17 + READ_LATENCY
+
+* per layer descriptor, 20 + L edges outside the layer itself: 16 fetch reads
+  plus L to drain the read pipeline, then decode, launch and the move to the
+  next descriptor. At L = 1 that is 21 edges, under 1 % of the smallest layer
+  in the test networks (a 2x2 global average, ~26 cycles, is the exception).
+* the END descriptor costs 17 + L: its fetch and decode.
+* each layer's cycle-RAM word equals the engine formula for that layer
+  (conv_layer, pool_layer, add_layer), so per-layer counts read back through
+  the CYC window are directly comparable with the models.
+* through the board (top, sweep-top and sweep-net): the same per-layer counts
+  read back over the UART for random networks, a LeNet-class plan and a
+  ResNet basic block, byte-exact outputs for every layer.
+
+Example, from `host/run_network.py --dry-run --plan lenet --h 32 --w 32 --c 3`
+at N = 8, L = 1: seven layers, 82 455 layer cycles + 7 x 21 + 18 = 82 620
+edges, 0.83 ms at 100 MHz.
