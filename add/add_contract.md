@@ -22,7 +22,7 @@ datapath write port. An add needs a word from a, a word from b, and one write.
 | --- | --- | --- |
 | reads per output word | 2, one after the other on the same port | 2 at once |
 | best case throughput | 1 word per 2 cycles (read-bound) | 1 word per cycle |
-| throughput with this datapath | 1 word per `M_BITS + 2L + 3` cycles (measured below); the bit-serial rescale, not the port, sets it | the same, because the rescale still sets it |
+| throughput with this datapath | 1 word per `M_BITS + L + 3` cycles (measured below); the bit-serial rescale, not the port, sets it | the same, because the rescale still sets it |
 | BRAM | no change | every bank duplicated, or bram.sv rebuilt as true dual port with the write port shared. Duplicating at N=8, ADDR_WIDTH=12: +8 BRAM36 per bank, so 3 banks become 48, and with B (16) and P the total is ~65 of **50**. It does not fit |
 | touches verified blocks | no (act_buffer and bram unchanged) | act_buffer, bram and every engine's read path |
 
@@ -110,7 +110,7 @@ elementwise op is a linear walk. For each word:
 
 This reference version serializes the words (the next reads start after the
 write is registered). Overlapping word i+1's reads with word i's multiply is
-the obvious next step. It saves `2L + 2` cycles per word.
+the obvious next step. It saves `L + 2` cycles per word.
 
 ## Illegal configurations
 
@@ -136,6 +136,25 @@ These are as for pool_layer:
 * Reset is synchronous, and no write lands on or after the reset edge.
 * Destination words are left either old or final.
 
-## Measured (filled in from simulation)
+## Measured (from simulation, N 1/2/4/8 x READ_LATENCY 1/2 x NBUF 2/3)
 
-    TBD
+These are edge counts from the edge that accepts `start` (L = READ_LATENCY):
+
+    check phase (err visible)  : DIM_W + CW_W + 1 = 16 edges, for every check
+    start to done              : 16 + W * (M_BITS + L + 3) + 1,   W = h*w*c_words
+    per word                   : read a (1) + read b (1) + until b is in (L)
+                                 + M_BITS shift-and-add steps + output (1)
+
+The TB asserts this on every command it runs. At M_BITS = 8 and L = 1, a
+word costs 12 cycles, so the 32x32x16 ResNet-20 residual (2048 words at
+N = 8) takes about 24.6 k cycles, or 0.25 ms at 100 MHz.
+
+The paper estimate in decision 1 first said `2L`. The measurement shows `L`:
+b's read is issued one cycle after a's, and a has already arrived by the time
+b does.
+
+Mutation pass: 13 injected bugs, all caught. They cover both zero points,
+which bank and multiplier each operand uses, the bit position of the
+shift-and-add, the last multiplier bit, rounding, both clamps, ReLU, the b
+pointer, the two bank checks, the reset gate on the write, and the output
+zero point.
