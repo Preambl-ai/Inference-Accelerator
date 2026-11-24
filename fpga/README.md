@@ -122,6 +122,19 @@ and add sit between registers, and the owner mux sits in front of the BRAM
 ports, which the act_buffer read already crossed through conv_layer's host
 mux.
 
+**Added by phase 2 (residual add).** These are estimates until you run Vivado.
+
+| block | DSP | BRAM36 | LUT | FF | notes |
+| ----- | --- | ------ | --- | -- | ----- |
+| add_layer | 0 | 0 | ~0.7-0.9 k | ~0.7 k | No multipliers: the rescale is bit-serial. Per lane at N=8: a 19-bit three-input add, and a round, zero point and clamp stage. `a - za` and `b - zb` are held in shifting registers (no barrel shifter). 3 x 19-bit registers per lane, plus a 64-bit a-word and the write register |
+| act_buffer, third bank (top NBUF 2 -> 3) | 0 | **+8** | ~0.05 k | 0 | 4096 x 64 b per bank at N=8. ResNet needs the input (skip), the branch and the sum in three banks |
+| layer_engine, 4-way owner mux | 0 | 0 | ~0.05 k | 0 | |
+
+Running total at N=8: **DSP unchanged (~86-90)**, **BRAM ~40 of 50**, LUT
+~9-12 k, FF ~10.5 k. BRAM is now the second resource to watch, after DSP.
+If it runs short, the first step is ADDR_WIDTH 12 -> 11 (each bank halves,
+-12 BRAM36), which still holds a 32x32x16 ResNet-20 map at N = 8 (2048 words).
+
 **DSP is the resource that decides whether N=8 fits.** If utilization shows
 more than 90, or placement fails on DSPs, try these in order:
 1. **Cap synthesis:** `-tclargs 8 1 1 1000000 84`. This passes

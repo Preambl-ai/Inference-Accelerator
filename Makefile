@@ -169,7 +169,7 @@ endif
 ifeq ($(MODULE_NAME),top)
 VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/rtl/uart_tx.sv
 VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/layer_engine/rtl/layer_engine.sv
-VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(CONV_SRCS)
+VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(PWD)/add/rtl/add_layer.sv $(CONV_SRCS)
 COMPILE_ARGS += -Ptop.N=$(N)
 COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
