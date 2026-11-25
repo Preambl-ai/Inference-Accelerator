@@ -238,7 +238,12 @@ module sequencer #(
                             state     <= S_IDLE;
                         end
                     end else begin
-                        state <= S_LAUNCH;
+                        // weights already on chip: its fetch count is 0, not
+                        // whatever an earlier program left in that slot
+                        cyc_we    <= 1'b1;
+                        cyc_waddr <= {1'b1, idx};
+                        cyc_wdata <= '0;
+                        state     <= S_LAUNCH;
                     end
                 end
 
