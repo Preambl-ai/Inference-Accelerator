@@ -109,13 +109,22 @@ module csr #(
     input  logic [IDX_W-1:0] seq_cur_index,
     input  logic [IDX_W:0] seq_layers_done,
     input  logic [IDX_W-1:0] seq_err_index,
-    input  logic [10:0] seq_err_code,
+    input  logic [15:0] seq_err_code,
     output logic desc_we,
     output logic [IDX_W+3:0] desc_waddr,
     output logic [31:0] desc_wdata,
     output logic cyc_rd_en,
-    output logic [IDX_W-1:0] cyc_rd_addr,
+    output logic [IDX_W:0] cyc_rd_addr,      // 2.1: upper half = weight-fetch cycles
     input  logic [31:0] cyc_rd_data,
+
+    // to and from wdma's host port (map 2.1, HAS_DMA = 1): one DDR access at a time
+    output logic ddr_req,
+    output logic ddr_we,
+    output logic [31:0] ddr_addr,
+    output logic [31:0] ddr_wdata,
+    input  logic ddr_ack,
+    input  logic [1:0] ddr_resp,
+    input  logic [31:0] ddr_rdata,
 
     // for the board LEDs
     output logic done_sticky,
@@ -126,8 +135,9 @@ module csr #(
     // map
     // ------------------------------------------------------------------
     localparam logic [31:0] ID_VALUE = 32'h434E_5631;     // "CNV1"
-    // 2.0: the descriptor sequencer. every 1.x register is unchanged
-    localparam logic [31:0] VERSION  = 32'h0002_0000;
+    // 2.0: the descriptor sequencer. 2.1: weights from DDR (the DDR window,
+    // DDR_BASE, DDR_WCRC, the fetch half of CYC). every 1.x register is unchanged
+    localparam logic [31:0] VERSION  = 32'h0002_0100;
 
     localparam logic [7:0] A_ID = 8'h00, A_VERSION = 8'h04, A_PARAMS0 = 8'h08, A_PARAMS1 = 8'h0C,
                            A_CTRL = 8'h10, A_STATUS = 8'h14, A_ERR_CODE = 8'h18, A_CYCLES = 8'h1C,
@@ -135,7 +145,7 @@ module csr #(
                            A_B_WCRC = 8'h2C, A_P_WCRC = 8'h30, A_LAUNCH = 8'h34,
                            A_PARAMS2 = 8'h38, A_CMD0 = 8'h40,
                            A_SEQ_CTRL = 8'h90, A_SEQ_STATUS = 8'h94, A_SEQ_ERR = 8'h98,
-                           A_DESC_WCRC = 8'h9C;
+                           A_DESC_WCRC = 8'h9C, A_DDR_BASE = 8'hA0, A_DDR_WCRC = 8'hA4;
     localparam int NCMD = 19;
 
     // a word of W bits takes S = ceil(W/32) slots, padded to a power of two
@@ -211,6 +221,12 @@ module csr #(
     // descriptor word written
     logic        seq_done_sticky, seq_err_sticky;
     logic [15:0] desc_wcrc;
+    // 2.1: the DDR window's 8 MB page, the CRC of every DDR word written, and
+    // the one DDR access that may be in flight (a write waits for its B here)
+    logic [8:0]  ddr_page;
+    logic [15:0] ddr_wcrc;
+    logic        ddr_wpend;
+    logic [31:0] ddr_wdata_q;
     // busy for the host rules: a layer running, or a program between layers
     logic        busy;
     assign busy = conv_busy || seq_busy;
@@ -248,10 +264,11 @@ module csr #(
     // ------------------------------------------------------------------
     // address decode, shared by reads and writes
     // ------------------------------------------------------------------
-    typedef enum logic [2:0] {R_REG, R_ACT, R_B, R_P, R_DESC, R_CYC, R_NONE} region_t;
+    typedef enum logic [2:0] {R_REG, R_ACT, R_B, R_P, R_DESC, R_CYC, R_DDR, R_NONE} region_t;
 
     function automatic region_t region_of(input logic [AXI_ADDR_W-1:0] a);
         if (a[23:8] == 16'h0)  return R_REG;
+        if (a[23])             return (HAS_DMA != 0) ? R_DDR : R_NONE;   // 2.1: 8 MB DDR window
         case (a[23:20])
             4'h1:    return R_ACT;
             4'h2:    return R_B;
@@ -274,8 +291,8 @@ module csr #(
     logic [AXI_ADDR_W-1:0] aw_q;
     logic [31:0] w_q;
 
-    assign s_awready = !aw_held && !s_bvalid;
-    assign s_wready  = !w_held  && !s_bvalid;
+    assign s_awready = !aw_held && !s_bvalid && !ddr_wpend;
+    assign s_wready  = !w_held  && !s_bvalid && !ddr_wpend;
 
     // decode of the held write
     region_t w_region;
@@ -294,18 +311,20 @@ module csr #(
     assign w_top_a  = (A_SHIFT == 0) || (int'(w_slot_a) == A_S - 1);
     assign w_top_p  = (P_SHIFT == 0) || (int'(w_slot_p) == P_S - 1);
 
-    logic do_write;
-    assign do_write = aw_held && w_held && !s_bvalid;
-
     // ------------------------------------------------------------------
     // read channel
     // ------------------------------------------------------------------
-    typedef enum logic [1:0] {RD_IDLE, RD_MEM, RD_CAP} rd_state_t;
+    // RD_DDR: waiting for wdma's answer to a DDR window read
+    typedef enum logic [1:0] {RD_IDLE, RD_MEM, RD_CAP, RD_DDR} rd_state_t;
     rd_state_t rd_state;
     logic [AXI_ADDR_W-1:0] ar_q;
     logic [$clog2(READ_LATENCY + 1)-1:0] rd_cnt;
 
-    assign s_arready = (rd_state == RD_IDLE) && !s_rvalid;
+    // one DDR access at a time: no write is performed while a DDR read waits,
+    // and no read is taken while a write is ready to go or a DDR write waits
+    logic do_write;
+    assign do_write  = aw_held && w_held && !s_bvalid && !ddr_wpend && (rd_state != RD_DDR);
+    assign s_arready = (rd_state == RD_IDLE) && !s_rvalid && !(aw_held && w_held) && !ddr_wpend;
 
     region_t r_region;
     logic [19:0] r_idx_a;
@@ -316,7 +335,7 @@ module csr #(
     logic [AI_W-1:0] rd_idx_q;
     logic [A_SHIFT > 0 ? A_SHIFT-1 : 0:0] rd_slot_q;
     logic rd_is_cyc;                        // the read in flight is the cycle RAM, not ACT
-    logic [IDX_W-1:0] rd_cyc_q;
+    logic [IDX_W:0] rd_cyc_q;
     assign host_rd_en   = (rd_state == RD_MEM) && !rd_is_cyc;
     assign host_rd_addr = rd_idx_q[ADDR_WIDTH-1:0];
     assign host_rd_sel  = rd_idx_q[AI_W-1 -: SEL_WIDTH];
@@ -348,8 +367,10 @@ module csr #(
             A_SEQ_CTRL: return {1'b1, 32'h0};
             A_SEQ_STATUS: return {1'b1, {16'(seq_layers_done), 8'(seq_cur_index), 5'h0,
                                          seq_err_sticky, seq_done_sticky, seq_busy}};
-            A_SEQ_ERR:  return {1'b1, {16'(seq_err_index), 5'h0, seq_err_code}};
+            A_SEQ_ERR:  return {1'b1, {16'(seq_err_index), seq_err_code}};
             A_DESC_WCRC: return {1'b1, {16'h0, desc_wcrc}};
+            A_DDR_BASE: return {(HAS_DMA != 0), {ddr_page, 23'h0}};
+            A_DDR_WCRC: return {(HAS_DMA != 0), {16'h0, ddr_wcrc}};
             default: begin
                 if (off >= A_CMD0 && off < A_CMD0 + 8'(4*NCMD) && off[1:0] == 2'b00) begin
                     // ZP_IN and ZP_OUT read back sign-extended
@@ -382,6 +403,8 @@ module csr #(
             seq_start <= 1'b0; seq_start_index <= '0;
             seq_done_sticky <= 1'b0; seq_err_sticky <= 1'b0;
             desc_we <= 1'b0; desc_waddr <= '0; desc_wdata <= '0; desc_wcrc <= 16'hFFFF;
+            ddr_page <= '0; ddr_wcrc <= 16'hFFFF; ddr_wpend <= 1'b0; ddr_wdata_q <= '0;
+            ddr_req <= 1'b0; ddr_we <= 1'b0; ddr_addr <= '0; ddr_wdata <= '0;
             for (int i = 0; i < NCMD; i++) cmd[i] <= '0;
             scratch <= '0; cycles <= '0; launch_count <= '0;
             act_wcrc <= 16'hFFFF; b_wcrc <= 16'hFFFF; p_wcrc <= 16'hFFFF;
@@ -403,6 +426,23 @@ module csr #(
             p_we    <= 1'b0;
             seq_start <= 1'b0;
             desc_we   <= 1'b0;
+            ddr_req   <= 1'b0;
+
+            // 2.1: wdma answers the DDR access in flight. a write's B goes out
+            // now (and only a write DDR took counts in DDR_WCRC); a read's R too
+            if (ddr_ack) begin
+                if (ddr_wpend) begin
+                    ddr_wpend <= 1'b0;
+                    s_bvalid  <= 1'b1;
+                    s_bresp   <= ddr_resp;
+                    if (ddr_resp == 2'b00) begin
+                        crc_t = ddr_wcrc;
+                        for (int k = 0; k < 4; k++)
+                            crc_t = crc16_byte(crc_t, ddr_wdata_q[k*8 +: 8]);
+                        ddr_wcrc <= crc_t;
+                    end
+                end
+            end
 
             // status from conv_layer. start (accepted on this edge, because
             // the CSR only starts when ready) and soft reset both clear the
@@ -468,6 +508,7 @@ module csr #(
                                     b_wcrc    <= 16'hFFFF;
                                     p_wcrc    <= 16'hFFFF;
                                     desc_wcrc <= 16'hFFFF;
+                                    ddr_wcrc  <= 16'hFFFF;
                                 end
                             end
                         end else if (w_off == A_SEQ_CTRL) begin
@@ -481,6 +522,10 @@ module csr #(
                             // W1C of the program's sticky bits, allowed while busy
                             if (w_q[1]) seq_done_sticky <= 1'b0;
                             if (w_q[2]) seq_err_sticky  <= 1'b0;
+                        end else if (w_off == A_DDR_BASE && HAS_DMA != 0) begin
+                            // 2.1: the DDR window's page; not while a program uses DDR
+                            if (busy) s_bresp <= 2'b10;
+                            else      ddr_page <= w_q[31:23];
                         end else if (w_off == A_STATUS) begin
                             // W1C, allowed while busy
                             if (w_q[2]) done_sticky <= 1'b0;
@@ -600,8 +645,23 @@ module csr #(
                         end
                     end
 
-                    // the cycle window is read only
-                    R_CYC: s_bresp <= (int'(aw_q[19:2]) >= DESC_DEPTH) ? 2'b11 : 2'b10;
+                    // the cycle window is read only (2.1: twice DESC_DEPTH entries)
+                    R_CYC: s_bresp <= (int'(aw_q[19:2]) >= 2 * DESC_DEPTH) ? 2'b11 : 2'b10;
+
+                    // 2.1: one 32-bit DDR word through wdma. B waits for DDR's
+                    // answer (ddr_ack, above); not while a program uses DDR
+                    R_DDR: begin
+                        if (busy) s_bresp <= 2'b10;
+                        else begin
+                            s_bvalid    <= 1'b0;
+                            ddr_wpend   <= 1'b1;
+                            ddr_req     <= 1'b1;
+                            ddr_we      <= 1'b1;
+                            ddr_addr    <= {ddr_page, aw_q[22:2], 2'b00};
+                            ddr_wdata   <= w_q;
+                            ddr_wdata_q <= w_q;
+                        end
+                    end
 
                     default: s_bresp <= 2'b11;
                 endcase
@@ -645,12 +705,12 @@ module csr #(
                             // 2.0: per-descriptor cycle counts, through the same
                             // latency-handled path as ACT
                             R_CYC: begin
-                                if (int'(s_araddr[19:2]) >= DESC_DEPTH) begin
+                                if (int'(s_araddr[19:2]) >= 2 * DESC_DEPTH) begin
                                     s_rdata <= '0; s_rresp <= 2'b11; s_rvalid <= 1'b1;
                                 end else if (busy) begin
                                     s_rdata <= '0; s_rresp <= 2'b10; s_rvalid <= 1'b1;
                                 end else begin
-                                    rd_cyc_q  <= s_araddr[2 +: IDX_W];
+                                    rd_cyc_q  <= s_araddr[2 +: IDX_W + 1];
                                     rd_is_cyc <= 1'b1;
                                     rd_cnt    <= '0;
                                     rd_state  <= RD_MEM;
@@ -661,6 +721,17 @@ module csr #(
                                 s_rdata <= '0;
                                 s_rresp <= (int'(s_araddr[19:2]) >= DESC_DEPTH * 16) ? 2'b11 : 2'b10;
                                 s_rvalid <= 1'b1;
+                            end
+                            // 2.1: one 32-bit DDR word through wdma; R waits for it
+                            R_DDR: begin
+                                if (busy) begin
+                                    s_rdata <= '0; s_rresp <= 2'b10; s_rvalid <= 1'b1;
+                                end else begin
+                                    ddr_req  <= 1'b1;
+                                    ddr_we   <= 1'b0;
+                                    ddr_addr <= {ddr_page, s_araddr[22:2], 2'b00};
+                                    rd_state <= RD_DDR;
+                                end
                             end
                             // B and P are write only; outside the windows is unmapped
                             R_B, R_P: begin s_rdata <= '0; s_rresp <= 2'b10; s_rvalid <= 1'b1; end
@@ -680,6 +751,15 @@ module csr #(
                     s_rresp  <= 2'b00;
                     s_rvalid <= 1'b1;
                     rd_state <= RD_IDLE;
+                end
+                // 2.1: wdma's answer is the R beat, data and response
+                RD_DDR: begin
+                    if (ddr_ack) begin
+                        s_rdata  <= ddr_rdata;
+                        s_rresp  <= ddr_resp;
+                        s_rvalid <= 1'b1;
+                        rd_state <= RD_IDLE;
+                    end
                 end
                 default: rd_state <= RD_IDLE;
             endcase
