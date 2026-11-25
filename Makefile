@@ -30,6 +30,9 @@ CONV_NBUF ?= 2
 # the residual add reads two banks and writes a third
 ADD_NBUF ?= 3
 DESC_DEPTH ?= 32
+SEQ_HAS_DMA ?= 0
+SEQ_WEIGHTS ?=
+export SEQ_WEIGHTS
 LAYERS ?=
 export LAYERS
 SEED ?=
@@ -233,7 +236,9 @@ COMPILE_ARGS += -Pseq_harness.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pseq_harness.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Pseq_harness.NBUF=$(ADD_NBUF)
 COMPILE_ARGS += -Pseq_harness.DESC_DEPTH=$(DESC_DEPTH)
-SIM_BUILD = sim_build/seq_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)_dd_$(DESC_DEPTH)
+COMPILE_ARGS += -Pseq_harness.HAS_DMA=$(SEQ_HAS_DMA)
+VERILOG_SOURCES += $(PWD)/dma/rtl/wdma.sv
+SIM_BUILD = sim_build/seq_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)_dd_$(DESC_DEPTH)_dma_$(SEQ_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),act_buffer)
@@ -499,6 +504,14 @@ sweep-seq:
 	done
 	@echo "=== seq N=4 READ_LATENCY=2 DESC_DEPTH=16 (index wrap) ==="
 	@$(MAKE) -s MODULE_NAME=seq_harness N=4 READ_LATENCY=2 ADDR_WIDTH=10 DESC_DEPTH=16 || exit 1
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== seq + wdma N=$$n READ_LATENCY=$$rl, mixed weights, AXI_LAT=3 ==="; \
+	    $(MAKE) -s MODULE_NAME=seq_harness N=$$n READ_LATENCY=$$rl ADDR_WIDTH=10 SEQ_HAS_DMA=1 AXI_LAT=3 || exit 1; \
+	  done; \
+	done
+	@echo "=== seq + wdma N=8 READ_LATENCY=2, DDR weights, AXI_LAT=9, 30 % backpressure ==="
+	@$(MAKE) -s MODULE_NAME=seq_harness N=8 READ_LATENCY=2 ADDR_WIDTH=10 SEQ_HAS_DMA=1 AXI_LAT=9 AXI_STALL=0.3 SEQ_WEIGHTS=ddr || exit 1
 	@echo "=== seq sweep passed ==="
 
 # whole networks through the UART pins at N=8 (sweep-top runs them at N=2/4
