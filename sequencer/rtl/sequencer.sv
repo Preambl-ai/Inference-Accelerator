@@ -4,6 +4,11 @@
 //   fetch descriptor idx (16 x 32-bit words) -> END? stop : start the engine
 //   -> count edges to done -> cycle RAM[idx] = count -> idx + 1 -> fetch ...
 //
+// phase 4: a CONV descriptor with its weight-source bit set first has wdma
+// copy the layer's B and P from DDR into the on-chip B/P (b_base, p_base),
+// counting that fetch into cycle RAM[DESC_DEPTH + idx], then runs the layer
+// as before. a descriptor without the bit runs exactly as in phase 3.
+//
 // the descriptor RAM is 32 bits wide (one BRAM18 for 32 descriptors) and a
 // descriptor is fetched in 16 reads, with rd_en held high and a tag pipeline
 // meeting the data, as everywhere else. the decoded fields sit on the engine
@@ -19,6 +24,9 @@ module sequencer #(
     parameter int M_BITS       = 8,
     parameter int DESC_DEPTH   = 32,
     parameter int READ_LATENCY = 1,        // of the descriptor and cycle RAMs
+    parameter int HAS_DMA      = 0,        // a wdma is attached (weights may come from DDR)
+    parameter int K_WIDTH      = 11,
+    parameter int AXI_AW       = 32,
     // derived, do not override
     parameter int SEL_WIDTH    = (NBUF > 1) ? $clog2(NBUF) : 1,
     parameter int IDX_W        = (DESC_DEPTH > 1) ? $clog2(DESC_DEPTH) : 1
@@ -35,17 +43,27 @@ module sequencer #(
     output logic [IDX_W-1:0] cur_index,
     output logic [IDX_W:0] layers_done,
     output logic [IDX_W-1:0] err_index,
-    output logic [10:0] err_code,
+    output logic [15:0] err_code,           // [9:0] engine, [10] E_NOEND, [14:11] wdma, [15] E_NODMA
 
     // descriptor RAM write port (from the CSR)
     input  logic desc_we,
     input  logic [IDX_W+3:0] desc_waddr,
     input  logic [31:0] desc_wdata,
 
-    // cycle RAM read port (to the CSR)
+    // cycle RAM read port (to the CSR): [0, DESC_DEPTH) layer cycles,
+    // [DESC_DEPTH, 2*DESC_DEPTH) weight-fetch cycles
     input  logic cyc_rd_en,
-    input  logic [IDX_W-1:0] cyc_rd_addr,
+    input  logic [IDX_W:0] cyc_rd_addr,
     output logic [31:0] cyc_rd_data,
+
+    // wdma fetch command (unused when HAS_DMA = 0)
+    output logic dma_start,
+    output logic [AXI_AW-1:0] dma_b_src, dma_p_src,
+    output logic [K_WIDTH-1:0] dma_k,
+    input  logic dma_ready,
+    input  logic dma_done,
+    input  logic dma_err,
+    input  logic [3:0] dma_err_code,
 
     // layer_engine command bus
     output logic eng_start,
@@ -71,11 +89,12 @@ module sequencer #(
     initial begin
         if (DESC_DEPTH < 2 || (DESC_DEPTH & (DESC_DEPTH - 1)) != 0)
             $fatal(1, "sequencer: DESC_DEPTH must be a power of two >= 2 (got %0d)", DESC_DEPTH);
-        if (ADDR_WIDTH > 16 || B_ADDR_W > 16 || P_ADDR_W > 8 || SEL_WIDTH > 4 || M_BITS > 16)
+        if (ADDR_WIDTH > 16 || B_ADDR_W > 16 || P_ADDR_W > 8 || SEL_WIDTH > 4 || M_BITS > 16 ||
+            K_WIDTH > 16 || AXI_AW > 32)
             $fatal(1, "sequencer: a field is wider than its descriptor slot");
     end
 
-    typedef enum logic [2:0] {S_IDLE, S_FETCH, S_DECODE, S_LAUNCH, S_RUN, S_NEXT} state_t;
+    typedef enum logic [2:0] {S_IDLE, S_FETCH, S_DECODE, S_DMA, S_LAUNCH, S_RUN, S_NEXT} state_t;
     state_t state;
     assign busy = (state != S_IDLE);
 
@@ -135,21 +154,32 @@ module sequencer #(
     assign add_shift  = dw[5][27:24];
     assign add_ma     = dw[6][M_BITS-1:0];
     assign add_mb     = dw[6][16 +: M_BITS];
+    // weight source (phase 4): word 7 [0] = B and P come from DDR, [31:16] =
+    // K (B words per output group); words 8 and 9 = DDR byte addresses
+    logic  w_ddr;
+    assign w_ddr      = dw[7][0];
+    assign dma_k      = dw[7][16 +: K_WIDTH];
+    assign dma_b_src  = dw[8][AXI_AW-1:0];
+    assign dma_p_src  = dw[9][AXI_AW-1:0];
 
     // ------------------------------------------------------------------
     // run
     // ------------------------------------------------------------------
     logic [31:0] cnt;
     logic cyc_we;
-    logic [IDX_W-1:0] cyc_waddr;
+    logic [IDX_W:0] cyc_waddr;
     logic [31:0] cyc_wdata;
+    logic dma_started;
 
-    bram #(.DATA_WIDTH(32), .ADDR_WIDTH(IDX_W), .READ_LATENCY(READ_LATENCY)) u_cyc (
+    bram #(.DATA_WIDTH(32), .ADDR_WIDTH(IDX_W + 1), .READ_LATENCY(READ_LATENCY)) u_cyc (
         .clk(clk), .we(cyc_we), .waddr(cyc_waddr), .wdata(cyc_wdata),
         .re(cyc_rd_en), .raddr(cyc_rd_addr), .rdata(cyc_rd_data)
     );
 
     assign eng_start = (state == S_LAUNCH) && eng_ready;
+    // wdma is idle here by construction (only the sequencer starts it, and
+    // the CSR refuses host DDR access while a program runs)
+    assign dma_start = (state == S_DMA) && !dma_started && dma_ready;
 
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -164,6 +194,7 @@ module sequencer #(
             err_index   <= '0;
             layers_done <= '0;
             cyc_we      <= 1'b0;
+            dma_started <= 1'b0;
         end else begin
             done   <= 1'b0;
             err    <= 1'b0;
@@ -196,8 +227,40 @@ module sequencer #(
                     if (dw[0][2:0] == 3'd0) begin
                         done  <= 1'b1;                 // END
                         state <= S_IDLE;
+                    end else if (dw[0][2:0] == 3'd1 && w_ddr) begin
+                        if (HAS_DMA != 0) begin
+                            dma_started <= 1'b0;
+                            state       <= S_DMA;      // weights from DDR first
+                        end else begin
+                            err       <= 1'b1;         // no wdma in this build
+                            err_index <= idx;
+                            err_code  <= 16'h8000;
+                            state     <= S_IDLE;
+                        end
                     end else begin
                         state <= S_LAUNCH;
+                    end
+                end
+
+                // count edges from the accepting edge to wdma's done or err,
+                // the same rule as a layer's count
+                S_DMA: begin
+                    if (dma_start) begin
+                        dma_started <= 1'b1;
+                        cnt         <= '0;
+                    end else if (dma_started) begin
+                        cnt <= cnt + 1'b1;
+                        if (dma_done) begin
+                            cyc_we    <= 1'b1;
+                            cyc_waddr <= {1'b1, idx};
+                            cyc_wdata <= cnt;  // edges from the accepting edge to done
+                            state     <= S_LAUNCH;
+                        end else if (dma_err) begin
+                            err       <= 1'b1;
+                            err_index <= idx;
+                            err_code  <= {1'b0, dma_err_code, 11'b0};
+                            state     <= S_IDLE;
+                        end
                     end
                 end
 
@@ -215,14 +278,14 @@ module sequencer #(
                     cnt <= cnt + 1'b1;
                     if (eng_done) begin
                         cyc_we      <= 1'b1;
-                        cyc_waddr   <= idx;
+                        cyc_waddr   <= {1'b0, idx};
                         cyc_wdata   <= cnt;
                         layers_done <= layers_done + 1'b1;
                         state       <= S_NEXT;
                     end else if (eng_err) begin
                         err       <= 1'b1;
                         err_index <= idx;
-                        err_code  <= {1'b0, eng_err_code};
+                        err_code  <= {6'b0, eng_err_code};
                         state     <= S_IDLE;
                     end
                 end
@@ -231,7 +294,7 @@ module sequencer #(
                     if (int'(idx) == DESC_DEPTH - 1) begin
                         err       <= 1'b1;             // ran off the end: no END
                         err_index <= idx;
-                        err_code  <= 11'b100_0000_0000;
+                        err_code  <= 16'h0400;
                         state     <= S_IDLE;
                     end else begin
                         idx   <= idx + 1'b1;
