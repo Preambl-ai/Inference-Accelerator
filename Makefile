@@ -31,6 +31,7 @@ CONV_NBUF ?= 2
 ADD_NBUF ?= 3
 DESC_DEPTH ?= 32
 SEQ_HAS_DMA ?= 0
+CSR_HAS_DMA ?= 0
 SEQ_WEIGHTS ?=
 export SEQ_WEIGHTS
 LAYERS ?=
@@ -168,7 +169,8 @@ COMPILE_ARGS += -Pcsr.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pcsr.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Pcsr.NBUF=$(NBUF)
 COMPILE_ARGS += -Pcsr.DESC_DEPTH=$(DESC_DEPTH)
-SIM_BUILD = sim_build/csr_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)_dd_$(DESC_DEPTH)
+COMPILE_ARGS += -Pcsr.HAS_DMA=$(CSR_HAS_DMA)
+SIM_BUILD = sim_build/csr_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)_dd_$(DESC_DEPTH)_dma_$(CSR_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),top)
@@ -424,6 +426,12 @@ sweep-csr:
 	      echo "=== csr N=$$n READ_LATENCY=$$rl NBUF=$$nb ==="; \
 	      $(MAKE) -s MODULE_NAME=csr N=$$n READ_LATENCY=$$rl NBUF=$$nb ADDR_WIDTH=6 || exit 1; \
 	    done; \
+	  done; \
+	done
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== csr + DDR window N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=csr N=$$n READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=6 CSR_HAS_DMA=1 || exit 1; \
 	  done; \
 	done
 	@echo "=== csr DESC_DEPTH=4 (index wrap, small windows) ==="
