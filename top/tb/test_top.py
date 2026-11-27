@@ -33,6 +33,12 @@ from conv_layer_model import (E_HOST, E_SEL, Layer, check_command, err_names, es
 from layers import expected, hw_params, layer_images
 
 
+def rand_words(rng, n, count):
+    """count random act words of n bytes; from bytes, so N = 8 (2^64) fits"""
+    b = rng.bytes(n * count)
+    return [int.from_bytes(b[i * n:(i + 1) * n], "little") for i in range(count)]
+
+
 class UartTransport:
     """async transport for protocol.run_async, bit-level on the DUT's pins"""
 
@@ -141,7 +147,7 @@ class TopHarness:
     # -- act_buffer contents through the UART ----------------------------------
     async def fill_bank(self, bank, words=None):
         depth = 1 << self.hw.addr_width
-        words = words if words is not None else [int(v) for v in self.rng.integers(0, 1 << (8 * self.n), depth)]
+        words = words if words is not None else rand_words(self.rng, self.n, depth)
         imgs = P.memory_images(self.hw, act=[(bank, 0, words)])
         await self.run(P.load(self.hw, imgs, self.stats))
         for i, w in enumerate(words):
@@ -444,7 +450,7 @@ async def test_bus_errors_and_refusals(dut):
     assert (st, words) == (P.ST_DECERR, [launches, params2, 0, 0]), \
         f"DECERR mid burst read: {P.STATUS_NAMES.get(st, st)} {words}"
     # -- ACT refusals by host_mode, on the real act_buffer
-    word = [int(h.rng.integers(0, 1 << (8 * h.n)))]
+    word = rand_words(h.rng, h.n, 1)
     st, _ = await h.raw(P.pkt_burst_write(h.hw.act_addr(1, 3), word))
     assert st == P.ST_SLVERR, "ACT write without host_mode was accepted"
     await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
@@ -485,7 +491,7 @@ async def test_dropped_bytes_mid_answer(dut):
     t, clk = h.t, dut.CLK100MHZ
     st = await h.run(P.check_dropped(h.stats))
     assert not st & P.ST_DROPPED, "DROPPED set on a clean link"
-    words_in = [int(v) for v in h.rng.integers(0, 1 << (8 * h.n), 64)]
+    words_in = rand_words(h.rng, h.n, 64)
     await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
     await h.run(P.burst_write(h.hw.act_addr(0, 0), words_in, h.stats))
     await h.run(P.write32(P.A_CTRL, 0, h.stats))
