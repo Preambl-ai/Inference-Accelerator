@@ -3,13 +3,14 @@
 // contract: layer_engine/layer_engine_contract.md.
 //
 //   op 1 CONV -> conv_core      op 2 MAX2, op 3 GAVG -> pool_layer
+//   op 4 ADD  -> add_layer (residual add of two banks into a third)
 //
 // one start and one command bus: the op picks the engine, which latches the
 // fields it uses. two engines can therefore never be started together; the
 // only overlap left (two engines busy at once) is a simulation $fatal no
 // legal input reaches.
 //
-// owner = conv_busy ? CONV : pool_busy ? POOL : HOST. the read port follows
+// owner = conv_busy ? CONV : pool_busy ? POOL : add_busy ? ADD : HOST. the read port follows
 // the owner (host_rd_* when nobody is busy, as on conv_layer); the datapath
 // write port follows it too and is held off when nobody is busy.
 //
@@ -27,6 +28,7 @@ module layer_engine #(
     parameter int P_ADDR_W     = 6,
     parameter int DIM_W        = 8,
     parameter int CW_W         = 7,
+    parameter int M_BITS       = 8,        // add_layer's rescale multiplier width
     // derived, do not override
     parameter int SEL_WIDTH    = (NBUF > 1) ? $clog2(NBUF) : 1,
     parameter int P_WIDTH      = 5 + 16 + 32
@@ -62,10 +64,18 @@ module layer_engine #(
     input  logic [ADDR_WIDTH-1:0] dst_base,
     input  logic [B_ADDR_W-1:0] b_base,
     input  logic [P_ADDR_W-1:0] p_base,
+    // the second add operand and the add rescale
+    input  logic [SEL_WIDTH-1:0] src2_sel,
+    input  logic [ADDR_WIDTH-1:0] src2_base,
+    input  logic signed [DATA_WIDTH-1:0] zp_in2,
+    input  logic [M_BITS-1:0] add_ma,
+    input  logic [M_BITS-1:0] add_mb,
+    input  logic [3:0] add_shift,
 
     // status
     output logic conv_busy,
     output logic pool_busy,
+    output logic add_busy,
     output logic tile_launch,
 
     // B and P write ports, idle only
@@ -89,21 +99,21 @@ module layer_engine #(
 );
 
     localparam int WORD_W = N * DATA_WIDTH;
-    localparam logic [2:0] OP_CONV = 3'd1, OP_MAX2 = 3'd2, OP_GAVG = 3'd3;
+    localparam logic [2:0] OP_CONV = 3'd1, OP_MAX2 = 3'd2, OP_GAVG = 3'd3, OP_ADD = 3'd4;
 
     // ------------------------------------------------------------------
     // dispatch
     // ------------------------------------------------------------------
     logic go, op_ok, bad_q;
     logic [2:0] op_q;                       // op of the command in flight
-    assign op_ok = (op == OP_CONV) || (op == OP_MAX2) || (op == OP_GAVG);
-    assign busy  = conv_busy || pool_busy || bad_q;
+    assign op_ok = (op == OP_CONV) || (op == OP_MAX2) || (op == OP_GAVG) || (op == OP_ADD);
+    assign busy  = conv_busy || pool_busy || add_busy || bad_q;
     assign ready = !busy;
     assign go    = start && ready;
 
-    logic conv_done, conv_err, pool_done, pool_err;
+    logic conv_done, conv_err, pool_done, pool_err, add_done, add_err;
     logic [8:0] conv_code;
-    logic [9:0] pool_code;
+    logic [9:0] pool_code, add_code;
 
     // a bad op is rejected like any other illegal command: busy for the
     // accepting edge, err with E_MODE on the next. the engines' own pulses
@@ -131,8 +141,8 @@ module layer_engine #(
         end
     end
 
-    assign done    = conv_done || pool_done;
-    assign err     = conv_err || pool_err || bad_err_q;
+    assign done    = conv_done || pool_done || add_done;
+    assign err     = conv_err || pool_err || add_err || bad_err_q;
     assign done_op = op_q;
     // each engine holds its code until its next start; show the code of the
     // engine the last command went to
@@ -140,6 +150,7 @@ module layer_engine #(
         if (bad_code_q)            err_code = 10'b10_0000_0000;     // E_MODE
         else if (op_q == OP_CONV)  err_code = {1'b0, conv_code};
         else if (op_q == OP_MAX2 || op_q == OP_GAVG) err_code = pool_code;
+        else if (op_q == OP_ADD)   err_code = add_code;
         else                       err_code = '0;
     end
 
@@ -151,7 +162,11 @@ module layer_engine #(
     logic [ADDR_WIDTH-1:0] c_rd_addr, c_waddr, p_rd_addr, p_waddr_a;
     logic [SEL_WIDTH-1:0] c_rd_sel, c_wr_sel, p_rd_sel, p_wr_sel;
     logic [WORD_W-1:0] c_wdata, p_wdata_a;
-    logic conv_ready, pool_ready;
+    logic conv_ready, pool_ready, add_ready;
+    logic d_rd_en, d_we;
+    logic [ADDR_WIDTH-1:0] d_rd_addr, d_waddr;
+    logic [SEL_WIDTH-1:0] d_rd_sel, d_wr_sel;
+    logic [WORD_W-1:0] d_wdata;
 
     conv_core #(
         .N(N), .DATA_WIDTH(DATA_WIDTH), .ADDR_WIDTH(ADDR_WIDTH), .READ_LATENCY(READ_LATENCY),
@@ -190,6 +205,22 @@ module layer_engine #(
         .we(p_we_a), .waddr(p_waddr_a), .wdata(p_wdata_a), .wr_sel(p_wr_sel)
     );
 
+    add_layer #(
+        .N(N), .DATA_WIDTH(DATA_WIDTH), .ADDR_WIDTH(ADDR_WIDTH), .READ_LATENCY(READ_LATENCY),
+        .NBUF(NBUF), .DIM_W(DIM_W), .CW_W(CW_W), .M_BITS(M_BITS)
+    ) u_add (
+        .clk(clk), .reset(reset),
+        .start(go && op == OP_ADD), .ready(add_ready), .busy(add_busy),
+        .done(add_done), .err(add_err), .err_code(add_code),
+        .h_in(h_in), .w_in(w_in), .c_words(cin_words),
+        .src_sel(src_sel), .src_base(src_base), .src2_sel(src2_sel), .src2_base(src2_base),
+        .dst_sel(dst_sel), .dst_base(dst_base),
+        .za(zp_in), .zb(zp_in2), .zo(zp_out), .ma(add_ma), .mb(add_mb), .shift(add_shift),
+        .relu_en(relu_en), .host_mode(host_mode),
+        .rd_en(d_rd_en), .rd_addr(d_rd_addr), .rd_sel(d_rd_sel), .rd_data(act_rdata),
+        .we(d_we), .waddr(d_waddr), .wdata(d_wdata), .wr_sel(d_wr_sel)
+    );
+
     // ------------------------------------------------------------------
     // the act_buffer and its owner mux
     // ------------------------------------------------------------------
@@ -205,6 +236,9 @@ module layer_engine #(
         end else if (pool_busy) begin
             a_rd_en = p_rd_en;  a_rd_addr = p_rd_addr;  a_rd_sel = p_rd_sel;
             a_we    = p_we_a;   a_waddr   = p_waddr_a;  a_wdata  = p_wdata_a; a_wr_sel = p_wr_sel;
+        end else if (add_busy) begin
+            a_rd_en = d_rd_en;  a_rd_addr = d_rd_addr;  a_rd_sel = d_rd_sel;
+            a_we    = d_we;     a_waddr   = d_waddr;    a_wdata  = d_wdata;   a_wr_sel = d_wr_sel;
         end else begin
             a_rd_en = host_rd_en; a_rd_addr = host_rd_addr; a_rd_sel = host_rd_sel;
             a_we    = 1'b0;       a_waddr   = '0;           a_wdata  = '0;       a_wr_sel = '0;
@@ -226,9 +260,9 @@ module layer_engine #(
 `ifndef SYNTHESIS
     always @(posedge clk) begin
         if (!reset) begin
-            if (conv_busy && pool_busy)
-                $fatal(1, "layer_engine: conv and pool busy in the same cycle");
-            if ((c_we && !conv_busy) || (p_we_a && !pool_busy))
+            if ((conv_busy && pool_busy) || (conv_busy && add_busy) || (pool_busy && add_busy))
+                $fatal(1, "layer_engine: two engines busy in the same cycle");
+            if ((c_we && !conv_busy) || (p_we_a && !pool_busy) || (d_we && !add_busy))
                 $fatal(1, "layer_engine: an engine that does not own the port raised its write enable");
         end
     end

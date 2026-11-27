@@ -29,7 +29,9 @@ module top #(
     parameter int TIMEOUT_BITS = 1000,
     parameter logic [31:0] BUILD_ID = 32'h0,
     parameter int ADDR_WIDTH   = 12,
-    parameter int NBUF         = 2,
+    // three banks: a ResNet block needs its input (the skip), the branch and
+    // the sum in three different banks (add_layer reads two, writes a third)
+    parameter int NBUF         = 3,
     parameter int K_MAX        = 1024,
     parameter int K_WIDTH      = 11,
     parameter int B_ADDR_W     = 13,
@@ -222,7 +224,10 @@ module top #(
         .clk(clk), .reset(sys_reset || soft_reset),
         .start(conv_start), .op(3'd1), .ready(conv_ready), .busy(conv_busy), .done(conv_done),
         .err(conv_err), .err_code(engine_err_code), .done_op(),
-        .conv_busy(), .pool_busy(), .tile_launch(),
+        .conv_busy(), .pool_busy(), .add_busy(), .tile_launch(),
+        // the add operand fields are only reachable through the descriptor
+        // sequencer (phase 3); the legacy conv command leaves them at 0
+        .src2_sel('0), .src2_base('0), .zp_in2('0), .add_ma('0), .add_mb('0), .add_shift('0),
         .h_in(h_in), .w_in(w_in), .h_out(h_out), .w_out(w_out),
         .cin_words(cin_words), .cout_words(cout_words), .kh(kh), .kw(kw),
         .stride(stride), .pad(pad), .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
