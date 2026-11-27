@@ -158,6 +158,8 @@ In the sequencer, a DDR layer costs its fetch plus 2 edges (start
 handshake, done) on top of the sequencer's per-layer overhead. The fetch
 count goes into the second half of the cycle RAM (sequencer contract).
 Example, ResNet-20 on a 32x32x3 input at N=8, every conv from DDR, L = 12:
-all 22 convs fetch 39 225 edges of 1 809 224 from start to done (2.2 %).
-That is measured in seq_harness (sweep-net) and equals the formula. Layers
-take 1 769 265 edges and the sequencer 734.
+all 22 convs fetch about 39.2 k edges of 1.81 M from start to done (2.2 %).
+That is measured in seq_harness (sweep-net) and equals the formula every
+time. The exact count moves with the seed, because the images' random
+placement decides which bursts split at a 4 KB line: 39 225 and 39 199 in
+two runs. Layers take 1 769 265 edges and the sequencer 734.
