@@ -408,6 +408,16 @@ layer can already be done, and done is cleared by the next start.
   the bridge, the CSR's bus logic, the command registers, host_mode,
   LAUNCH_COUNT or the write CRCs. The bus is in the middle of answering the
   very write that asked for it, and the host needs LAUNCH_COUNT to survive.
+  2.1: a soft reset does not reset wdma (the MIG cannot be reset halfway
+  through an AXI burst). wdma takes it as an abort: no new burst, the one in
+  flight is accepted to RLAST and thrown away (dma/dma_contract.md, decision
+  4). Until that burst ends, SEQ_STATUS.busy and STATUS.busy stay 1, and the
+  CSR refuses what it refuses while a program runs: SLVERR for B, P, ACT,
+  DESC, DDR window and SEQ_CTRL.start. That is at most one burst of 256
+  beats plus the DDR latency, a few microseconds. At 1 Mbaud, the host's
+  next request after the soft reset will almost always find busy at 0
+  already. A host that polls SEQ_STATUS until busy is 0 is always safe.
+  top's TB holds the slave mid-burst to check it.
 * **UART RX** is the only asynchronous input besides the button. It goes
   through a 2-flop synchronizer (reset value 1 = idle) before the start-bit
   detector.

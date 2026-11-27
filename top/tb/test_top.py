@@ -12,6 +12,11 @@ its expected words and cycles (sequencer_model over the conv, pool and add
 models); network.board_run is the same load / program / run / read-back
 sequence run_network.py sends to the board.
 
+Weights from DDR (map 2.1, TOP_HAS_DMA=1): dma/tb/axi4_slave.Axi4Slave plays
+the MIG on top's ddr_port (u_ddr), with latency and backpressure from AXI_LAT
+and AXI_STALL. The host fills DDR through the CSR's DDR window over the same
+UART link, and the slave checks every AXI4 rule on wdma's bursts.
+
 Fault injection lives in the transport: a hook can flip or drop one byte of a
 chosen request, or garble a response, and the tests check that the bridge's
 answer and the host's retry logic deal with it.
@@ -26,6 +31,7 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 from cocotb.utils import get_sim_time
 import numpy as np
 
+from axi4_slave import Axi4Slave
 import network as NET
 import protocol as P
 from conv_layer_model import (E_HOST, E_SEL, Layer, check_command, err_names, estimate_cycles,
@@ -119,15 +125,26 @@ class TopHarness:
         self.rng = np.random.default_rng(self.seed)
         self.t = UartTransport(dut, self.cpb, self.timeout_bits)
         self.stats = P.LinkStats()
+        self.has_dma = g("HAS_DMA")
+        self.alat = int(os.environ.get("AXI_LAT") or 3)
+        self.stall = float(os.environ.get("AXI_STALL") or 0)
+        self.slave = None
+        if self.has_dma:
+            self.slave = Axi4Slave(dut.g_dma.u_ddr, dut.CLK100MHZ, size=1 << 20, latency=self.alat,
+                                   ar_stall=self.stall, r_gap=self.stall, seed=self.seed)
 
     def where(self):
-        return f"(reproduce: make MODULE_NAME=top N={self.n} SEED={self.seed})"
+        return (f"(reproduce: make MODULE_NAME=top N={self.n} READ_LATENCY={self.lat} "
+                f"TOP_HAS_DMA={self.has_dma} AXI_LAT={self.alat} AXI_STALL={self.stall} "
+                f"SEED={self.seed})")
 
     async def start(self):
         d = self.dut
         cocotb.start_soon(Clock(d.CLK100MHZ, 10, unit="ns").start())
         d.btn_rst.value = 0
         self.t.start()
+        if self.slave:
+            self.slave.start()
         await ClockCycles(d.CLK100MHZ, 60)          # power-on reset runs out
         self.hw, self.build = await self.run(P.identify(self.stats))
         self.mirror = {}
@@ -694,7 +711,7 @@ async def test_program_error(dut):
     assert (pr.err_index, pr.err_code, pr.layers_done) == (bad, 1 << 9, bad), \
         f"SEQ_ERR index {pr.err_index} code {pr.err_code:#x}, {pr.layers_done} layers done"
     e = net.expected
-    assert res.outputs == e.outputs[:bad] and pr.cycles == e.cycles[:bad], \
+    assert [res.outputs.get(i) for i in range(bad)] == e.outputs[:bad] and pr.cycles == e.cycles[:bad], \
         "the layers before the bad descriptor differ from the model"
     dut._log.info(f"bad op at descriptor {bad}: SEQ_ERR code {pr.err_code:#x} (E_MODE), "
                   f"{pr.layers_done} layers done and right")
@@ -732,3 +749,106 @@ async def test_program_busy_and_soft_reset(dut):
     st = await h.run(P.read32(P.A_SEQ_STATUS, h.stats))
     assert st & 0x7 == 0, f"SEQ_STATUS {st:#x} after soft reset: not idle"
     await run_net(h, net, 0, "rerun after soft reset")
+
+
+# ---------------------------------------------------------------------------- map 2.1
+
+async def seq_status(h):
+    return await h.run(P.read32(P.A_SEQ_STATUS, h.stats))
+
+
+def check_fetches(h, net, res, name):
+    """every DDR conv shows a fetch count, every on-chip layer 0; with a slave
+    that never stalls, each count is the wdma formula's"""
+    got, exp = res.program.fetch_cycles, net.expected.fetch_cycles
+    assert len(got) == len(exp), f"{name}: {len(got)} fetch counts, model {len(exp)}"
+    for i, (g, e) in enumerate(zip(got, exp)):
+        assert (g == 0) == (e == 0), f"{name}: layer {i} fetch {g}, model {e} {h.where()}"
+        if h.stall == 0:
+            assert g == e, f"{name}: layer {i} fetch {g} cycles, wdma formula {e} {h.where()}"
+
+
+@cocotb.test()
+async def test_ddr_weights_program(dut):
+    """map 2.1: a network whose convs fetch B and P from DDR (filled over the
+    UART through the DDR window) runs from one start and matches NumPy; the
+    fetch half of the cycle window holds each layer's fetch time (the wdma
+    formula when the slave does not stall); a mixed network (some convs on
+    chip, some from DDR) does too, from another descriptor index; DDR reads
+    back through the window. without wdma a DDR descriptor fails with E_NODMA
+    before anything runs"""
+    h = await fresh(dut)
+    hw = hw_params(h.hw)
+    assert h.hw.has_dma == h.has_dma, f"PARAMS2 says DMA {h.hw.has_dma}, build {h.has_dma}"
+    plan = ["conv3", "res", "resd", "gavg", "fc:10"]
+    net = NET.build(h.rng, hw, m_bits=h.hw.m_bits, plan=plan, h=4, w=4, read_latency=h.lat,
+                    desc_depth=h.hw.desc_depth, weights="ddr", axi_latency=h.alat)
+    if not h.has_dma:
+        await h.run(P.load(h.hw, NET.images(h.hw, net), h.stats))
+        await h.run(P.load_program(net.descriptors, 0, h.stats))
+        pr = await h.run(P.run_program(0, h.stats))
+        assert (pr.err_index, pr.err_code, pr.layers_done) == (0, 1 << P.E_NODMA, 0), \
+            f"SEQ_ERR index {pr.err_index} code {pr.err_code:#x}, {pr.layers_done} layers done"
+        s, _ = await h.raw(P.pkt_burst_read(P.DDR_WIN, 1), 1)
+        assert s == P.ST_DECERR, f"DDR window without wdma: {P.STATUS_NAMES.get(s, s)}"
+        dut._log.info("no wdma: E_NODMA at descriptor 0, DDR window DECERR")
+        return
+    res = await run_net(h, net, 0, "DDR weights")
+    check_fetches(h, net, res, "DDR weights")
+    # read a stretch of the image back through the window
+    addr, data = net.ddr_images[0]
+    want = [int.from_bytes(data[i:i + 4], "little") for i in range(0, min(len(data), 64), 4)]
+    await h.run(P.write32(P.A_DDR_BASE, addr & ~(P.DDR_WIN_SIZE - 1), h.stats))
+    got = await h.run(P.burst_read(P.DDR_WIN + (addr & (P.DDR_WIN_SIZE - 1)), len(want), h.stats))
+    assert got == want, f"DDR read back through the window differs {h.where()}"
+    mixed = NET.build(h.rng, hw, m_bits=h.hw.m_bits, plan=["conv3", "conv3", "res", "conv1", "gavg"],
+                      h=4, w=4, read_latency=h.lat, desc_depth=h.hw.desc_depth, weights="mixed",
+                      axi_latency=h.alat)
+    first = h.hw.desc_depth - len(mixed.descriptors)
+    res = await run_net(h, mixed, first, f"mixed weights from {first}")
+    check_fetches(h, mixed, res, "mixed weights")
+
+
+@cocotb.test()
+async def test_ddr_soft_reset_mid_fetch(dut):
+    """soft reset while wdma waits on a burst: the program stops, but wdma
+    still owes the slave the rest of the burst, so SEQ_STATUS stays busy and
+    the CSR refuses B and P writes and the DDR window until it drains; once
+    the slave answers, the board goes idle, no AXI rule was broken, and a
+    clean rerun matches NumPy"""
+    h = await fresh(dut)
+    if not h.has_dma:
+        return
+    c = 2 * h.n
+    net = NET.build(h.rng, hw_params(h.hw), m_bits=h.hw.m_bits, plan=[f"conv3:{c}"] * 2,
+                    h=4, w=4, c=c, read_latency=h.lat, desc_depth=h.hw.desc_depth,
+                    weights="ddr", axi_latency=h.alat)
+    await h.run(P.load(h.hw, NET.images(h.hw, net), h.stats))
+    await h.run(P.load_ddr(net.ddr_images, h.stats))
+    await h.run(P.load_program(net.descriptors, 0, h.stats))
+    h.slave.r_gap = 1.0                     # R beats stop: the first fetch hangs mid-burst
+    await h.run(P.start_program(0, h.stats))
+    for _ in range(50):
+        if h.slave.ar_log:
+            break
+        await ClockCycles(dut.CLK100MHZ, 50)
+    assert h.slave.ar_log, "wdma issued no burst"
+    st = await seq_status(h)
+    assert st & P.SEQ_BUSY and st >> 16 == 0, f"SEQ_STATUS {st:#x} during the first fetch"
+    await h.run(P.write32(P.A_CTRL, P.CTRL_SOFT_RESET, h.stats))
+    st = await seq_status(h)
+    assert st & P.SEQ_BUSY, f"SEQ_STATUS {st:#x}: idle while wdma still owes its burst"
+    for pkt in (P.pkt_burst_write(h.hw.b_addr(0), [1, 2]), P.pkt_write32(P.A_SEQ_CTRL, P.SEQ_START),
+                P.pkt_write32(P.DDR_WIN, 0)):
+        s, _ = await h.raw(pkt)
+        assert s == P.ST_SLVERR, f"accepted while wdma drains: {P.STATUS_NAMES.get(s, s)}"
+    h.slave.r_gap = h.stall
+    for _ in range(200):
+        st = await seq_status(h)
+        if not st & P.SEQ_BUSY:
+            break
+    assert not st & P.SEQ_BUSY, f"SEQ_STATUS {st:#x}: wdma never drained"
+    assert h.slave.idle(), "the slave still has a burst open after the drain"
+    assert len(h.slave.ar_log) == 1, f"{len(h.slave.ar_log)} bursts: wdma issued one after the abort"
+    dut._log.info(f"soft reset mid-burst: busy until the burst drained ({h.slave.ar_log[0][1]} beats)")
+    await run_net(h, net, 0, "rerun after soft reset mid-fetch")
