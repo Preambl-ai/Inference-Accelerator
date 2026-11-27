@@ -149,6 +149,26 @@ Running total at N=8: **DSP unchanged (~86-90)**, **BRAM ~41.5 of 50**, LUT
 registered and sit on the engine bus for many cycles before eng_start, so it
 adds no critical path.
 
+**Added by phase 4 (weights from DDR).** These are estimates until you run Vivado.
+The default build (`HAS_DMA` = 0) gets only the descriptor RAM change. wdma,
+the CSR's DDR window and the MIG come in with `HAS_DMA` = 1 (section 6).
+
+| block | DSP | BRAM36 | LUT | FF | notes |
+| ----- | --- | ------ | --- | -- | ----- |
+| descriptor RAM, DESC_DEPTH 32 -> 64 | 0 | **+0.5** | ~0.05 k | ~0.01 k | 1024 x 32 b is one BRAM36 (was one BRAM18). ResNet-20 is 33 descriptors with END. The cycle RAM doubles twice (64 entries, plus the fetch half): 128 x 32 b, still LUTRAM |
+| wdma (HAS_DMA = 1) | 0 | 0 | ~0.4-0.6 k | ~0.45 k | No multipliers. The burst planner is adds, compares and shifts. Four 32-bit address counters, the 64-bit R beat into the B write register, the 53-bit P word, and the range checks at their own widths (RB_W/RP_W). One AR outstanding, so no FIFO |
+| csr, map 2.1 (HAS_DMA = 1) | 0 | 0 | ~0.15 k | ~0.12 k | DDR_BASE page, the DDR window's request/ack handshake, DDR_WCRC (another 32-bit CRC-16 XOR tree) |
+| top, B/P write mux | 0 | 0 | ~0.1 k | 0 | wdma or the CSR onto the B and P write ports, switched by wdma's busy |
+| MIG 7-series, DDR3L x16 (when added) | 0 | ~0-1 | **~5-6 k** | **~6-7 k** | Typical for one 16-bit DDR3 with an AXI4 slave; Vivado's report after generating it is the number to trust. It also takes an MMCM/PLL and the DDR3 bank's IO |
+
+Running total at N=8: default build **DSP ~86-90, BRAM ~42 of 50**, LUT ~10-13 k,
+FF ~11 k. With HAS_DMA = 1 and the MIG: BRAM ~42-43, **LUT ~16-20 k of
+20.8 k**, FF ~18 k. **LUT becomes the resource to watch.** If it does not fit,
+build N=4 with DMA: N=4 frees about a quarter of the datapath LUTs and
+three-quarters of the PE DSPs. wdma is off the datapath. Its only path into
+the engine is the B/P write mux, which sits in front of the BRAM write
+ports, register to register.
+
 **DSP is the resource that decides whether N=8 fits.** If utilization shows
 more than 90, or placement fails on DSPs, try these in order:
 1. **Cap synthesis:** `-tclargs 8 1 1 1000000 84`. This passes
@@ -180,3 +200,56 @@ If timing fails, change these first:
 
 Either way, N is the parameter that buys fit. Clock speed and READ_LATENCY
 buy timing.
+
+## 6. DDR3 through the MIG (weights from DDR, HAS_DMA = 1)
+
+Phase 4 adds wdma, which fetches a layer's B and P from DDR over AXI4 before
+the layer runs. That is how ResNet-8 and ResNet-20 run: their weights do not
+fit on chip. The RTL and its verification are complete against an AXI4 slave
+model (dma/tb/axi4_slave.py), which checks every AXI rule wdma relies on, with
+latency and backpressure. **What is not in the repository is the MIG itself.**
+`dma/rtl/ddr_port.sv` marks its place. In simulation the slave model drives
+it; in synthesis it stops a `HAS_DMA = 1` build with a `$fatal` until it is
+replaced. The steps, in Vivado, none of them verified here:
+
+1. **Generate the MIG** (IP catalog, Memory Interface Generator, 7 Series):
+   DDR3 SDRAM, the Arty A7's part (MT41K128M16JT-125, 16 bits, 256 MB). Digilent's
+   Arty A7 board files fill in the pins and timing; without them, use
+   Digilent's published MIG project file (.prj) for the board. Memory clock
+   325-333 MHz (4:1), **AXI4 interface, data width 64, ID width 4**. Those
+   are wdma's widths: `AXI_IDW` = 4 and 8-byte beats, and the MIG's AXI
+   width converter handles the 128-bit native side. Address width 28 (256
+   MB).
+2. **Clocks.** The MIG wants a system clock (166.67 MHz on the Arty) and a
+   200 MHz reference clock. Make both from CLK100MHZ with one MMCM, outside
+   the MIG. The AXI side of the MIG runs on its `ui_clk` (memory clock / 4,
+   about 81-83 MHz), not on the design's clock. Pick one of:
+   - **Run the whole design on `ui_clk`** (simplest: one clock domain, as
+     now). Replace `clk` in top with `ui_clk`, hold `sys_reset` while
+     `init_calib_complete` is low, and set `CLKS_PER_BIT` from the real
+     frequency. At 1 Mbaud an 83.33 MHz clock is not an integer divisor; use
+     a baud rate that divides it, and pass it to the host as `--baud`.
+   - Keep the design at 100 MHz and put an **AXI Clock Converter** IP between
+     wdma and the MIG. This costs ~1 k LUT more and adds a real clock-domain
+     crossing to constrain.
+3. **Replace ddr_port.** Instantiate the generated MIG in place of `u_ddr` in
+   `top.sv`'s `g_dma` branch: the same AXI4 signal names, its `aresetn` from
+   `!sys_reset`, and its DDR3 pins (`ddr3_dq`, `ddr3_dqs_p/n`, `ddr3_addr`,
+   `ddr3_ba`, `ddr3_ras_n`, `ddr3_cas_n`, `ddr3_we_n`, `ddr3_reset_n`,
+   `ddr3_ck_p/n`, `ddr3_cke`, `ddr3_cs_n`, `ddr3_dm`, `ddr3_odt`) brought out
+   as ports of top. The MIG's own XDC sets their pins and IO standards; add
+   it to build.tcl with `read_ip` or `read_xdc`. The MIG's write channel is
+   wired already: the host reaches DDR through the CSR's DDR window as single
+   AXI beats.
+4. **Build** with `-tclargs 8 1 1 <baud> -1 1` (the sixth argument is
+   HAS_DMA). Check `PARAMS2[16]` reads 1 on the board, then run
+   `python host/run_network.py --port ... --plan resnet8 --h 32 --w 32 --c 3`.
+   A first DDR test without the CNN: write and read back a few words through
+   the DDR window (`protocol.load_ddr` checks the write CRC).
+
+Things to expect on the board that the simulation cannot show. Fetch times
+depend on refresh and the MIG's real latency. The cycle window's second half
+reports them per layer, and the ResNets are compute-bound anyway: weight
+fetch is 2.0 % of ResNet-20's cycles at AXI latency 1, and 2.5 % at 30
+(network.py's model, 32x32x3, N=8). Calibration also has to finish before the first DDR access.
+`init_calib_complete` belongs in the reset, as above.
