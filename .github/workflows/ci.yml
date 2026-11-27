@@ -54,7 +54,7 @@ jobs:
           PYTHONPATH=host python csr/model/csr_model.py
           python ci/check_flow.py Makefile
           PYTHONPATH=conv_layer/model:systolic_array/model python pool/model/pool_model.py
-          PYTHONPATH=conv_layer/model:systolic_array/model:pool/model python layer_engine/model/layer_engine_model.py
+          PYTHONPATH=conv_layer/model:systolic_array/model:pool/model:add/model python layer_engine/model/layer_engine_model.py
           PYTHONPATH=conv_layer/model:systolic_array/model python add/model/add_model.py
 
       - name: systolic array sweep
