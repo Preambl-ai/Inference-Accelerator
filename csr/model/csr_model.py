@@ -12,7 +12,8 @@ Responses are AXI codes: 0 OKAY, 2 SLVERR, 3 DECERR.
 from protocol import (A_ACT_WCRC, A_B_WCRC, A_BUILD_ID, A_CMD0, A_CTRL, A_CYCLES, A_ERR_CODE,
                       A_ID, A_LAUNCH, A_P_WCRC, A_PARAMS0, A_PARAMS1, A_SCRATCH, A_STATUS,
                       A_VERSION, ACT_BASE, B_BASE, CMD_FIELDS, ID_VALUE, P_BASE, P_WIDTH, VERSION,
-                      crc16, slot_shift, word_bytes)
+                      A_PARAMS2, A_SEQ_CTRL, A_SEQ_STATUS, A_SEQ_ERR, A_DESC_WCRC, DESC_BASE,
+                      CYC_BASE, crc16, slot_shift, word_bytes)
 
 OKAY, SLVERR, DECERR = 0, 2, 3
 
@@ -20,8 +21,10 @@ OKAY, SLVERR, DECERR = 0, 2, 3
 class CsrModel:
 
     def __init__(self, n=8, addr_width=12, read_latency=1, nbuf=2, b_addr_w=13, p_addr_w=6,
-                 k_max=1024, dim_w=8, cw_w=7, build_id=0):
+                 k_max=1024, dim_w=8, cw_w=7, build_id=0, desc_depth=32, m_bits=8, has_dma=0):
         self.n, self.aw, self.lat, self.nbuf = n, addr_width, read_latency, nbuf
+        self.desc_depth, self.m_bits, self.has_dma = desc_depth, m_bits, has_dma
+        self.idx_w = (desc_depth - 1).bit_length()
         self.b_aw, self.p_aw, self.k_max, self.build_id = b_addr_w, p_addr_w, k_max, build_id
         self.sel_w = (nbuf - 1).bit_length() if nbuf > 1 else 1
         self.word_w = 8 * n
@@ -44,6 +47,12 @@ class CsrModel:
         self.commits = []            # ("act", sel, addr, word) / ("b", addr, word) / ("p", addr, word)
         self.starts = 0
         self.soft_resets = 0
+        # map 2.0: the sequencer as the CSR sees it. `seq` is driven by the TB
+        # (what the sequencer reports); the rest is CSR state
+        self.seq = dict(busy=0, cur_index=0, layers_done=0, err_index=0, err_code=0)
+        self.seq_done = self.seq_err = 0
+        self.desc_crc = 0xFFFF
+        self.seq_starts = []            # start index of every program start, in order
 
     # -- helpers -------------------------------------------------------------
     def params0(self):
@@ -52,10 +61,15 @@ class CsrModel:
     def params1(self):
         return (self.k_max << 8) | self.p_aw
 
+    def params2(self):
+        return (self.has_dma << 16) | (self.desc_depth << 8) | self.m_bits
+
     def _window(self, addr):
         if addr >> 8 == 0:
             return "reg", None, None
         top = addr >> 20
+        if top in (4, 5):                   # 2.0: descriptor words / cycle counts, one slot
+            return ("desc" if top == 4 else "cyc"), (addr & 0xFFFFF) >> 2, 0
         name = {1: "act", 2: "b", 3: "p"}.get(top)
         if name is None:
             return None, None, None
@@ -65,6 +79,10 @@ class CsrModel:
         return name, word >> sh, word & ((1 << sh) - 1)
 
     def _index_ok(self, name, idx):
+        if name == "desc":
+            return idx < self.desc_depth * 16
+        if name == "cyc":
+            return idx < self.desc_depth
         if name == "act":
             return idx >> (self.sel_w + self.aw) == 0 and (idx >> self.aw) < self.nbuf
         return idx >> (self.b_aw if name == "b" else self.p_aw) == 0
@@ -79,7 +97,11 @@ class CsrModel:
                 A_STATUS: self.status_word(busy), A_ERR_CODE: err_code, A_CYCLES: self.cycles,
                 A_SCRATCH: self.scratch, A_BUILD_ID: self.build_id,
                 A_ACT_WCRC: self.wcrc["act"], A_B_WCRC: self.wcrc["b"], A_P_WCRC: self.wcrc["p"],
-                A_LAUNCH: self.launch}
+                A_LAUNCH: self.launch, A_PARAMS2: self.params2(), A_SEQ_CTRL: 0,
+                A_SEQ_STATUS: (self.seq["layers_done"] << 16) | (self.seq["cur_index"] << 8)
+                              | (self.seq_err << 2) | (self.seq_done << 1) | self.seq["busy"],
+                A_SEQ_ERR: (self.seq["err_index"] << 16) | self.seq["err_code"],
+                A_DESC_WCRC: self.desc_crc}
         if off in vals:
             return vals[off]
         if A_CMD0 <= off < A_CMD0 + 4 * len(CMD_FIELDS) and off % 4 == 0:
@@ -113,6 +135,17 @@ class CsrModel:
                 self.host_mode = (data >> 2) & 1
                 if data & 8:
                     self.wcrc = {k: 0xFFFF for k in self.wcrc}
+                    self.desc_crc = 0xFFFF
+                return OKAY
+            if off == A_SEQ_CTRL:
+                if busy: return SLVERR
+                if data & 1:
+                    self.seq_starts.append((data >> 8) & ((1 << self.idx_w) - 1))
+                    self.seq_done = self.seq_err = 0
+                return OKAY
+            if off == A_SEQ_STATUS:
+                if data & 2: self.seq_done = 0
+                if data & 4: self.seq_err = 0
                 return OKAY
             if off == A_STATUS:
                 if data & 4: self.done = 0
@@ -132,8 +165,14 @@ class CsrModel:
         # windows
         if not self._index_ok(name, idx):
             return DECERR
+        if name == "cyc":
+            return SLVERR                   # read only
         if busy or (name == "act" and not self.host_mode):
             return SLVERR
+        if name == "desc":
+            self.desc_crc = crc16(data.to_bytes(4, "little"), self.desc_crc)
+            self.commits.append(("desc", idx, data))
+            return OKAY
         width = P_WIDTH if name == "p" else self.word_w
         slots = 1 << slot_shift(width)
         st = self.stage[name]
@@ -157,8 +196,9 @@ class CsrModel:
             self.commits.append((name, idx, word))
         return OKAY
 
-    def read(self, addr, busy=False, err_code=0, mem=None):
-        """mem(sel, addr) -> act word, for ACT reads. returns (resp, data)"""
+    def read(self, addr, busy=False, err_code=0, mem=None, cyc=None):
+        """mem(sel, addr) -> act word, for ACT reads; cyc(i) -> cycle-RAM word.
+        returns (resp, data)"""
         name, idx, slot = self._window(addr)
         if name is None:
             return DECERR, 0
@@ -167,8 +207,10 @@ class CsrModel:
             return (OKAY, v) if v is not None else (DECERR, 0)
         if not self._index_ok(name, idx):
             return DECERR, 0
-        if name in ("b", "p"):
-            return SLVERR, 0
+        if name in ("b", "p", "desc"):
+            return SLVERR, 0                # write only
+        if name == "cyc":
+            return (SLVERR, 0) if busy else (OKAY, cyc(idx))
         if busy or self.host_mode:
             return SLVERR, 0
         word = mem(idx >> self.aw, idx & ((1 << self.aw) - 1))
@@ -197,6 +239,11 @@ class CsrModel:
     def _soft_reset(self):
         self.cycles = 0
         self.done = self.err = 0
+        self.seq_done = self.seq_err = 0        # soft reset also resets the sequencer
+
+    def seq_finished(self, err=False):
+        if err: self.seq_err = 1
+        else:   self.seq_done = 1
 
 
 if __name__ == "__main__":
@@ -211,8 +258,8 @@ if __name__ == "__main__":
     m = CsrModel(n=8, nbuf=3)
     chk("ID", m.read(A_ID), (OKAY, ID_VALUE))
     chk("STATUS after reset (ready)", m.read(A_STATUS), (OKAY, 2))
-    chk("unmapped register hole", m.read(0x38), (DECERR, 0))
-    chk("unmapped region", m.read(0x500000), (DECERR, 0))
+    chk("unmapped register hole", m.read(0x3C), (DECERR, 0))
+    chk("unmapped region", m.read(0x600000), (DECERR, 0))
     chk("RO write refused", m.write(A_ID, 1), SLVERR)
     chk("KH masked to 3 bits", (m.write(A_CMD0 + 24, 0xFF), m.read(A_CMD0 + 24)), (OKAY, (OKAY, 7)))
     m.write(A_CMD0 + 40, 0x80)
@@ -258,6 +305,28 @@ if __name__ == "__main__":
     chk("count saturates at 0xFFFF", m.read(A_STATUS)[1] >> 16, 0xFFFF)
     m.write(A_STATUS, 0x20)
     chk("W1C bit 5 clears flag and count", m.read(A_STATUS)[1] & 0xFFFF0020, 0)
+
+    # map 2.0
+    m = CsrModel(n=4, nbuf=3, desc_depth=32, m_bits=8)
+    chk("VERSION is 2.0", m.read(A_VERSION)[1], 0x00020000)
+    chk("PARAMS2", m.read(A_PARAMS2)[1], (32 << 8) | 8)
+    chk("descriptor word written", (m.write(DESC_BASE + 4 * 17, 0xDEADBEEF), m.commits[-1]),
+        (OKAY, ("desc", 17, 0xDEADBEEF)))
+    chk("descriptor CRC", m.read(A_DESC_WCRC)[1], crc16((0xDEADBEEF).to_bytes(4, "little")))
+    chk("descriptor window is write only", m.read(DESC_BASE)[0], SLVERR)
+    chk("descriptor past the RAM is unmapped", m.write(DESC_BASE + 4 * 32 * 16, 0), DECERR)
+    chk("cycle window read", m.read(CYC_BASE + 8, cyc=lambda i: 100 + i), (OKAY, 102))
+    chk("cycle window is read only", m.write(CYC_BASE, 1), SLVERR)
+    chk("program start recorded with its index", (m.write(A_SEQ_CTRL, 1 | 5 << 8), m.seq_starts), (OKAY, [5]))
+    chk("busy: program start refused", m.write(A_SEQ_CTRL, 1, busy=True), SLVERR)
+    chk("busy: descriptor write refused", m.write(DESC_BASE, 1, busy=True), SLVERR)
+    chk("busy: cycle read refused", m.read(CYC_BASE, busy=True, cyc=lambda i: 0), (SLVERR, 0))
+    m.seq_finished(err=True)
+    chk("SEQ_STATUS err sticky, W1C", (m.read(A_SEQ_STATUS)[1] & 4, (m.write(A_SEQ_STATUS, 4),
+                                        m.read(A_SEQ_STATUS)[1] & 4)), (4, (OKAY, 0)))
+    m.seq_finished()
+    m.write(A_CTRL, 2)
+    chk("soft reset clears the program's sticky bits", m.read(A_SEQ_STATUS)[1] & 6, 0)
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)

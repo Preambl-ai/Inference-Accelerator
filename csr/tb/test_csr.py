@@ -7,6 +7,10 @@ The CSR runs against:
   - a stub for conv_layer and its act_buffer: the start/busy/done/err
     handshake with a programmable layer length, and the act_buffer read
     pipeline (READ_LATENCY deep, advancing only while host_rd_en is high);
+  - a stub for the sequencer (map 2.0): a program is a list of layer lengths;
+    while it runs it drives the conv stub's busy/done like the shared engine
+    does, so the legacy STATUS/CYCLES gating is exercised; it fills the cycle
+    RAM, whose read pipeline is READ_LATENCY deep like the act_buffer's;
   - csr_model.CsrModel, which predicts every response, every read value and
     every memory write the CSR commits.
 Sampling is in the ReadOnly phase; the stub and the BFM drive on the falling
@@ -21,13 +25,17 @@ from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge, ReadOnly, RisingEdge
 
 from csr_model import DECERR, OKAY, SLVERR, CsrModel
-from protocol import (A_ACT_WCRC, A_B_WCRC, A_BUILD_ID, A_CMD0, A_CTRL, A_CYCLES, A_ERR_CODE,
-                      A_ID, A_LAUNCH, A_P_WCRC, A_PARAMS0, A_PARAMS1, A_SCRATCH, A_STATUS,
-                      A_VERSION, ACT_BASE, B_BASE, CMD_FIELDS, P_BASE, P_WIDTH, slot_shift)
+from protocol import (A_ACT_WCRC, A_B_WCRC, A_BUILD_ID, A_CMD0, A_CTRL, A_CYCLES, A_DESC_WCRC,
+                      A_ERR_CODE, A_ID, A_LAUNCH, A_P_WCRC, A_PARAMS0, A_PARAMS1, A_PARAMS2,
+                      A_SCRATCH, A_SEQ_CTRL, A_SEQ_ERR, A_SEQ_STATUS, A_STATUS, A_VERSION,
+                      ACT_BASE, B_BASE, CMD_FIELDS, CYC_BASE, DESC_BASE, P_BASE, P_WIDTH,
+                      slot_shift)
 
 REGS = [A_ID, A_VERSION, A_PARAMS0, A_PARAMS1, A_CTRL, A_STATUS, A_ERR_CODE, A_CYCLES,
-        A_SCRATCH, A_BUILD_ID, A_ACT_WCRC, A_B_WCRC, A_P_WCRC, A_LAUNCH] + \
+        A_SCRATCH, A_BUILD_ID, A_ACT_WCRC, A_B_WCRC, A_P_WCRC, A_LAUNCH, A_PARAMS2,
+        A_SEQ_CTRL, A_SEQ_STATUS, A_SEQ_ERR, A_DESC_WCRC] + \
        [A_CMD0 + 4 * i for i in range(len(CMD_FIELDS))]
+HOLES = (0x3C, 0x8C, 0xA0, 0xFC, 0x600000, 0xF00000)
 
 
 def junk(sel, addr, n):
@@ -44,7 +52,9 @@ class CsrHarness:
         self.b_aw, self.p_aw = g("B_ADDR_W"), g("P_ADDR_W")
         self.model = CsrModel(n=self.n, addr_width=self.aw, read_latency=self.lat, nbuf=self.nbuf,
                               b_addr_w=self.b_aw, p_addr_w=self.p_aw, k_max=g("K_MAX"),
-                              build_id=g("BUILD_ID"))
+                              build_id=g("BUILD_ID"), desc_depth=g("DESC_DEPTH"),
+                              m_bits=g("M_BITS"), has_dma=g("HAS_DMA"))
+        self.desc_depth = g("DESC_DEPTH")
         self.sel_w = self.model.sel_w
         self.seed = int(os.environ.get("SEED") or random.randrange(2**31))
         self.rng = random.Random(self.seed)
@@ -61,12 +71,31 @@ class CsrHarness:
         self.pipe = [0, 0]
         self.accepts = 0
         self.busy_edges = 0             # edges since the accept while busy = live CYCLES
+        # sequencer stub state
+        self.seq_busy = 0
+        self.seq_done = self.seq_err = 0
+        self.seq_vals = dict(cur_index=0, layers_done=0, err_index=0, err_code=0)
+        self.next_prog = ([5, 3], 0)    # (layer lengths, err_code of the last; 0 = done)
+        self.prog_gap = (1, 3)          # sequencer-only edges before the first layer, between layers
+        self.prog = None                # [remaining layers, edges left in this one, gap]
+        self.seq_starts = []            # start index of every program the stub accepted
+        self.cyc = {}                   # cycle RAM: index -> count
+        self.cpipe = [0, 0]
+        self.cyc_runs = []
+        self._crun = None
 
     def where(self):
         return f"(reproduce: make MODULE_NAME=csr N={self.n} READ_LATENCY={self.lat} SEED={self.seed})"
 
     def word(self, sel, addr):
         return self.mem.get((sel, addr), junk(sel, addr, self.n))
+
+    def cyc_word(self, i):
+        return self.cyc.get(i, junk(99, i, 4))
+
+    @property
+    def any_busy(self):
+        return bool(self.busy or self.seq_busy)
 
     async def start(self):
         d = self.dut
@@ -92,6 +121,15 @@ class CsrHarness:
         d.conv_err.value = self.err
         d.conv_err_code.value = self.err_code
         d.host_rd_data.value = self.pipe[self.lat - 1]
+        d.seq_busy.value = self.seq_busy
+        d.seq_done.value = self.seq_done
+        d.seq_err.value = self.seq_err
+        d.seq_cur_index.value = self.seq_vals["cur_index"]
+        d.seq_layers_done.value = self.seq_vals["layers_done"]
+        d.seq_err_index.value = self.seq_vals["err_index"]
+        d.seq_err_code.value = self.seq_vals["err_code"]
+        d.cyc_rd_data.value = self.cpipe[self.lat - 1]
+        self.model.seq = dict(self.seq_vals, busy=self.seq_busy)
 
     async def _stub(self):
         """conv_layer + act_buffer, one virtual edge per real edge"""
@@ -101,11 +139,76 @@ class CsrHarness:
             s = {k: int(getattr(d, k).value) for k in (
                 "conv_start", "conv_soft_reset", "host_mode", "host_we", "host_waddr",
                 "host_wdata", "host_wr_sel", "host_rd_en", "host_rd_addr", "host_rd_sel",
-                "b_we", "b_waddr", "b_wdata", "p_we", "p_waddr", "p_wdata")}
+                "b_we", "b_waddr", "b_wdata", "p_we", "p_waddr", "p_wdata", "seq_start",
+                "seq_start_index", "desc_we", "desc_waddr", "desc_wdata", "cyc_rd_en",
+                "cyc_rd_addr")}
             await RisingEdge(d.clk)
+            # --- the edge: the sequencer (reset by soft reset, like top wires it)
+            self.seq_done = self.seq_err = 0
+            prog_done_pulse = False
+            if s["conv_soft_reset"]:
+                self.seq_busy, self.prog = 0, None
+                self.seq_vals = dict(cur_index=0, layers_done=0, err_index=0, err_code=0)
+            elif s["seq_start"] and not self.seq_busy:
+                assert not self.busy, "program started while a legacy layer runs"
+                self.seq_busy = 1
+                self.seq_starts.append(s["seq_start_index"])
+                self.seq_vals.update(cur_index=s["seq_start_index"], layers_done=0)
+                self.prog = [list(self.next_prog[0]), 0, self.prog_gap[0]]
+                self.prog_code = self.next_prog[1]
+            elif self.seq_busy:
+                # like the real sequencer, busy outlasts the engine's last
+                # done by a few edges (the cycle-RAM write and the next fetch)
+                layers, left, gap = self.prog
+                if left == 0 and gap:                       # fetch/launch/write-back
+                    self.prog[2] -= 1
+                    if self.prog[2] == 0 and layers:
+                        self.prog[1] = layers[0]            # engine starts: conv busy below
+                    elif self.prog[2] == 0:                 # program over
+                        i = self.seq_vals["cur_index"]
+                        self.seq_busy = 0
+                        if self.prog_code:
+                            self.seq_err = 1
+                            self.seq_vals.update(err_index=i, err_code=self.prog_code)
+                        else:
+                            self.seq_done = 1
+                            self.seq_vals["layers_done"] += 1
+                        self.model.seq_finished(err=bool(self.prog_code))
+                        self.prog = None
+                elif left:
+                    self.prog[1] -= 1
+                    if self.prog[1] == 0:                   # engine done
+                        i = self.seq_vals["cur_index"]
+                        self.cyc[i] = layers.pop(0)
+                        prog_done_pulse = True
+                        self.prog[2] = self.prog_gap[1]
+                        if layers:
+                            self.seq_vals["layers_done"] += 1
+                            self.seq_vals["cur_index"] = (i + 1) % self.desc_depth
+            if s["desc_we"]:
+                assert not self.seq_busy, "descriptor written while a program runs"
+                self.commits.append(("desc", s["desc_waddr"], s["desc_wdata"]))
+            if s["cyc_rd_en"]:
+                if self.lat == 2:
+                    self.cpipe[1] = self.cpipe[0]
+                self.cpipe[0] = self.cyc_word(s["cyc_rd_addr"])
+                if self._crun and self._crun[0] == s["cyc_rd_addr"]:
+                    self._crun[1] += 1
+                else:
+                    self._crun = [s["cyc_rd_addr"], 1]
+                    self.cyc_runs.append(self._crun)
+            else:
+                self._crun = None
             # --- the edge: conv_layer
             self.done = self.err = 0
-            if s["conv_soft_reset"]:
+            if self.prog is not None or prog_done_pulse:
+                # the engine as the program drives it: the CSR must not let
+                # these move the legacy STATUS/CYCLES (the model never hears them)
+                self.busy = int(self.prog is not None and self.prog[1] > 0)
+                self.done = int(prog_done_pulse)
+                if s["conv_start"] or s["conv_soft_reset"]:
+                    assert s["conv_soft_reset"], "legacy start while a program runs"
+            elif s["conv_soft_reset"]:
                 self.busy, self.remaining, self.err_code = 0, 0, 0
             elif s["conv_start"] and not self.busy:
                 self.busy, self.accepts = 1, self.accepts + 1
@@ -241,7 +344,7 @@ class CsrHarness:
 
     # -- checked operations -------------------------------------------------------
     async def chk_write(self, addr, data, **kw):
-        exp = self.model.write(addr, data, busy=bool(self.busy))
+        exp = self.model.write(addr, data, busy=self.any_busy)
         got = await self.write(addr, data, **kw)
         assert got == exp, f"write {addr:#08x} <- {data:#x}: bresp {got}, model {exp} {self.where()}"
         await self.idle(2)
@@ -250,9 +353,10 @@ class CsrHarness:
         return got
 
     async def chk_read(self, addr, **kw):
-        exp = self.model.read(addr, busy=bool(self.busy), err_code=self.err_code, mem=self.word)
-        runs = len(self.rd_runs)
-        live = addr == A_CYCLES and self.busy
+        exp = self.model.read(addr, busy=self.any_busy, err_code=self.err_code, mem=self.word,
+                              cyc=self.cyc_word)
+        runs, cruns = len(self.rd_runs), len(self.cyc_runs)
+        live = addr == A_CYCLES and self.busy and not self.seq_busy
         lo = self.busy_edges
         resp, data, edges = await self.read(addr, **kw)
         if live:
@@ -269,7 +373,18 @@ class CsrHarness:
                 f"host_rd_en runs {new_runs}, expected one run of {self.lat} edges at one address"
         else:
             assert not new_runs, f"host_rd_en moved for a read that is not a good ACT read: {new_runs}"
+        new_cruns = self.cyc_runs[cruns:]
+        if (addr >> 20) == 5 and resp == OKAY:
+            assert len(new_cruns) == 1 and new_cruns[0][1] == self.lat, \
+                f"cyc_rd_en runs {new_cruns}, expected one run of {self.lat} edges at one address"
+        else:
+            assert not new_cruns, f"cyc_rd_en moved for a read that is not a good CYC read: {new_cruns}"
         return resp, data, edges
+
+    async def settle(self):
+        while self.any_busy:
+            await self.idle(1)
+        await self.idle(2)
 
     async def idle(self, n):
         for _ in range(n):
@@ -302,6 +417,12 @@ class CsrHarness:
     def p_addr(self, idx, slot=0):
         return P_BASE + (((idx << slot_shift(P_WIDTH)) + slot) * 4)
 
+    def desc_addr(self, idx):
+        return DESC_BASE + 4 * idx
+
+    def cyc_addr(self, idx):
+        return CYC_BASE + 4 * idx
+
 
 async def fresh(dut):
     h = CsrHarness(dut)
@@ -330,9 +451,11 @@ async def test_register_read_write(dut):
         for v in (0xFFFFFFFF, 0, 0xA5A5A5A5, h.rng.getrandbits(32)):
             if a == A_CTRL:
                 v &= 0x4            # start/soft reset/clear have their own tests
+            if a == A_SEQ_CTRL:
+                v &= ~1             # program start has its own test
             await h.chk_write(a, v)
             await h.chk_read(a)
-    for a in (0x38, 0x3C, 0x8C, 0xFC, 0x400000, 0xF00000):
+    for a in HOLES:
         await h.chk_write(a, 1)
         await h.chk_read(a)
 
@@ -520,7 +643,7 @@ async def test_random_traffic(dut):
     errors and short layers, all against the model"""
     h = await fresh(dut)
     sa = 1 << slot_shift(8 * h.n)
-    addrs = REGS + [0x38, 0x90, 0x7FFFFC]
+    addrs = REGS + [0x3C, 0xA0, 0x7FFFFC]
     for i in range(600):
         kind = h.rng.random()
         kw = dict(order=h.rng.choice(("same", "aw", "w")), gap=h.rng.choice((0, 0, 2)),
@@ -533,6 +656,10 @@ async def test_random_traffic(dut):
             if a == A_CTRL:
                 v &= 0xC | (1 if h.rng.random() < 0.3 else 0)
                 h.next_layer = (h.rng.randint(1, 12), h.rng.choice((0, 0, 0, 0x40)))
+            if a == A_SEQ_CTRL:
+                v &= ~1 | (1 if h.rng.random() < 0.3 else 0)
+                h.next_prog = ([h.rng.randint(1, 6) for _ in range(h.rng.randint(1, 3))],
+                               h.rng.choice((0, 0, 0x400)))
             await h.chk_write(a, v, **kw)
         elif kind < 0.45:
             await h.chk_read(h.rng.choice(addrs), rdelay=h.rng.choice((0, 0, 2)))
@@ -546,6 +673,12 @@ async def test_random_traffic(dut):
                 await h.chk_write(h.b_addr(h.rng.randrange(4), h.rng.randrange(sa)), h.rng.getrandbits(32), **kw)
             else:
                 await h.chk_write(h.p_addr(h.rng.randrange(4), h.rng.randrange(2)), h.rng.getrandbits(32), **kw)
+        elif kind < 0.945:
+            if h.rng.random() < 0.6:
+                await h.chk_write(h.desc_addr(h.rng.randrange(h.desc_depth * 16 + 2)),
+                                  h.rng.getrandbits(32), **kw)
+            else:
+                await h.chk_read(h.cyc_addr(h.rng.randrange(h.desc_depth + 1)))
         elif kind < 0.96:
             await h.pulse_link_err()
         elif kind < 0.97:
@@ -554,7 +687,153 @@ async def test_random_traffic(dut):
             await h.chk_write(A_CTRL, 4 if h.rng.random() < 0.5 else 0)
         # the busy rules have their own test; here every access sees a settled
         # busy so the model's view of it is exact
-        while h.busy:
+        while h.any_busy:
             await h.idle(1)
     for a in REGS:
         await h.chk_read(a)
+
+
+@cocotb.test()
+async def test_descriptor_and_cycle_windows(dut):
+    """DESC: one word per write, no staging, CRC over its 4 bytes, write only,
+    DECERR past the RAM; CYC: read only, through the read pipeline with
+    cyc_rd_en held READ_LATENCY edges, DECERR past the RAM; CTRL.clear_crc
+    clears DESC_WCRC too; PARAMS2 reports the build"""
+    h = await fresh(dut)
+    await h.chk_read(A_PARAMS2)
+    await h.chk_write(A_CTRL, 4)                          # host_mode does not matter here
+    for i in (0, 1, 15, 16, h.desc_depth * 16 - 1):
+        await h.chk_write(h.desc_addr(i), h.rng.getrandbits(32),
+                          order=h.rng.choice(("same", "aw", "w")))
+        await h.chk_read(A_DESC_WCRC)
+    await h.chk_write(A_CTRL, 0)
+    await h.chk_write(h.desc_addr(h.desc_depth * 16), 1)  # past the RAM: DECERR
+    await h.chk_write(DESC_BASE + 0xFFFFC, 1)
+    for i in (0, h.desc_depth * 16 - 1, h.desc_depth * 16):
+        await h.chk_read(h.desc_addr(i))                  # write only / DECERR
+    lats = set()
+    for i in (0, 1, h.desc_depth - 1):
+        _, _, e = await h.chk_read(h.cyc_addr(i), rdelay=h.rng.choice((0, 2)))
+        lats.add(e)
+    assert len(lats) == 1, f"CYC read latency varies: {lats}"
+    dut._log.info(f"LATENCY CYC window read at READ_LATENCY={h.lat}: RVALID {lats.pop()} edges "
+                  f"after the AR handshake")
+    await h.chk_read(h.cyc_addr(h.desc_depth))            # DECERR
+    await h.chk_write(h.cyc_addr(0), 1)                   # read only
+    await h.chk_write(h.cyc_addr(h.desc_depth), 1)
+    await h.chk_write(A_CTRL, 8)
+    await h.chk_read(A_DESC_WCRC)
+
+
+@cocotb.test()
+async def test_program_start_status(dut):
+    """SEQ_CTRL starts a program at its index; SEQ_STATUS / SEQ_ERR follow the
+    sequencer; done and err are sticky, W1C one bit at a time and cleared by
+    the next start; the legacy STATUS, CYCLES and LAUNCH_COUNT do not move
+    while a program drives the engine; every layer's count lands in CYC"""
+    h = await fresh(dut)
+    # leave legacy done set first, so a program that cleared or set it shows
+    h.next_layer = (4, 0)
+    await h.chk_write(A_CTRL, 1)
+    await h.settle()
+    for layers, code, idx in (([6, 2, 9], 0, 3), ([3], 0x400, h.desc_depth - 1),
+                              ([2, 2], 0x004, 0), ([7], 0, 1)):
+        h.next_prog = (layers, code)
+        await h.chk_write(A_SEQ_CTRL, 1 | (idx << 8))
+        await h.settle()
+        for a in (A_SEQ_STATUS, A_SEQ_ERR, A_STATUS, A_CYCLES, A_LAUNCH):
+            await h.chk_read(a)
+        for k in range(len(layers)):
+            await h.chk_read(h.cyc_addr((idx + k) % h.desc_depth))
+        first, second = (0x2, 0x4) if code else (0x4, 0x2)
+        await h.chk_write(A_SEQ_STATUS, first)
+        await h.chk_read(A_SEQ_STATUS)
+        await h.chk_write(A_SEQ_STATUS, second)
+        await h.chk_read(A_SEQ_STATUS)
+    # the next start clears a sticky left set
+    h.next_prog = ([2], 0x10)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.settle()
+    await h.chk_read(A_SEQ_STATUS)
+    h.next_prog = ([2], 0)
+    await h.chk_write(A_SEQ_CTRL, 1 | (2 << 8))
+    await h.settle()
+    await h.chk_read(A_SEQ_STATUS)
+    await h.chk_write(A_SEQ_CTRL, 0)                      # no start bit: nothing happens
+    await h.settle()
+    # soft reset clears a done and an err left by finished programs (the
+    # sequencer is reset with layer_engine). a mutation run found no test
+    # soft-reset with a sticky set
+    await h.chk_read(A_SEQ_STATUS)
+    assert h.model.seq_done, "stimulus: the last program should have left done set"
+    await h.chk_write(A_CTRL, 2)
+    await h.chk_read(A_SEQ_STATUS)
+    h.next_prog = ([2], 0x40)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.settle()
+    await h.chk_write(A_CTRL, 2)
+    await h.chk_read(A_SEQ_STATUS)
+    assert h.seq_starts == h.model.seq_starts, f"starts {h.seq_starts} vs model {h.model.seq_starts}"
+
+
+@cocotb.test()
+async def test_program_busy_rules(dut):
+    """while a program runs: no descriptor writes, no CYC reads, no second
+    start, no legacy start, no memory writes; register reads, both W1Cs and
+    soft reset get through, and soft reset stops the program"""
+    h = await fresh(dut)
+    sa = 1 << slot_shift(8 * h.n)
+    await h.chk_write(h.b_addr(1, 0), 9)                  # staged, so a missing busy check commits
+    h.next_prog = ([100000], 0)
+    await h.chk_write(A_SEQ_CTRL, 1 | (5 % h.desc_depth) << 8)
+    await h.idle(4)
+    assert h.seq_busy and h.busy
+    for a in REGS:
+        await h.chk_read(a)
+        await h.chk_write(a, (0 if a == A_CTRL else 0xFFFFFFFF))
+    await h.chk_write(A_SEQ_CTRL, 1)                      # second start: refused
+    await h.chk_write(A_CTRL, 1)                          # legacy start: refused
+    await h.chk_write(A_CTRL, 4)                          # host_mode: refused
+    await h.chk_write(h.desc_addr(0), 0x1234)
+    await h.chk_read(h.cyc_addr(0))
+    await h.chk_write(h.b_addr(1, sa - 1), 1)
+    await h.chk_write(A_SEQ_STATUS, 0x6)
+    await h.chk_write(A_STATUS, 0xC)
+    assert h.seq_busy, "the stub program ended early"
+    await h.chk_write(A_CTRL, 2)                          # soft reset stops it
+    await h.idle(2)
+    assert not h.seq_busy and not h.busy
+    # the same rules while only the sequencer is busy (fetching a descriptor,
+    # the engine idle). a mutation run showed busy ignoring the sequencer went
+    # unseen: every check above ran with the engine busy too
+    await h.chk_write(h.b_addr(2, 0), 9)
+    await h.chk_write(A_CTRL, 4)
+    await h.chk_write(h.act_addr(0, 5, 0), 9)
+    await h.chk_write(A_CTRL, 0)
+    h.prog_gap = (100000, 3)
+    h.next_prog = ([2], 0)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.idle(3)
+    assert h.seq_busy and not h.busy, "stimulus: the engine should be idle in the fetch gap"
+    await h.chk_write(A_CTRL, 1)                          # legacy start
+    await h.chk_write(A_CTRL, 4)                          # host_mode
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.chk_write(h.desc_addr(3), 0x55)
+    await h.chk_read(h.cyc_addr(0))
+    await h.chk_write(h.b_addr(2, sa - 1), 1)
+    await h.chk_read(h.act_addr(0, 5, 0))
+    for a in (A_STATUS, A_SEQ_STATUS, A_SCRATCH):
+        await h.chk_read(a)
+        await h.chk_write(a, 0xFFFFFFF0)
+    assert h.accepts == 0, "a legacy start got through during a program"
+    await h.chk_write(A_CTRL, 2)
+    await h.idle(2)
+    h.prog_gap = (1, 3)
+    for a in (A_SEQ_STATUS, A_SEQ_ERR, A_STATUS, A_CYCLES):
+        await h.chk_read(a)
+    # a program after the soft reset runs normally
+    h.next_prog = ([3, 3], 0)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.settle()
+    await h.chk_read(A_SEQ_STATUS)
+    assert h.seq_starts == h.model.seq_starts

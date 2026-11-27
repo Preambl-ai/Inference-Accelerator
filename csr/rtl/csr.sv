@@ -31,9 +31,13 @@ module csr #(
     parameter int CW_W         = 7,
     parameter logic [31:0] BUILD_ID = 32'h0,
     parameter int AXI_ADDR_W   = 24,
+    parameter int M_BITS       = 8,        // add rescale width, reported in PARAMS2
+    parameter int DESC_DEPTH   = 32,       // sequencer descriptors
+    parameter int HAS_DMA      = 0,        // PARAMS2[16] (phase 4)
     // derived, do not override
     parameter int SEL_WIDTH    = (NBUF > 1) ? $clog2(NBUF) : 1,
-    parameter int P_WIDTH      = 53
+    parameter int P_WIDTH      = 53,
+    parameter int IDX_W        = (DESC_DEPTH > 1) ? $clog2(DESC_DEPTH) : 1
 )(
     input  logic clk,
     input  logic reset,
@@ -96,6 +100,23 @@ module csr #(
     output logic [P_ADDR_W-1:0] p_waddr,
     output logic [P_WIDTH-1:0] p_wdata,
 
+    // to and from the sequencer (map 2.0)
+    output logic seq_start,
+    output logic [IDX_W-1:0] seq_start_index,
+    input  logic seq_busy,
+    input  logic seq_done,
+    input  logic seq_err,
+    input  logic [IDX_W-1:0] seq_cur_index,
+    input  logic [IDX_W:0] seq_layers_done,
+    input  logic [IDX_W-1:0] seq_err_index,
+    input  logic [10:0] seq_err_code,
+    output logic desc_we,
+    output logic [IDX_W+3:0] desc_waddr,
+    output logic [31:0] desc_wdata,
+    output logic cyc_rd_en,
+    output logic [IDX_W-1:0] cyc_rd_addr,
+    input  logic [31:0] cyc_rd_data,
+
     // for the board LEDs
     output logic done_sticky,
     output logic err_sticky
@@ -105,13 +126,16 @@ module csr #(
     // map
     // ------------------------------------------------------------------
     localparam logic [31:0] ID_VALUE = 32'h434E_5631;     // "CNV1"
-    localparam logic [31:0] VERSION  = 32'h0001_0000;
+    // 2.0: the descriptor sequencer. every 1.x register is unchanged
+    localparam logic [31:0] VERSION  = 32'h0002_0000;
 
     localparam logic [7:0] A_ID = 8'h00, A_VERSION = 8'h04, A_PARAMS0 = 8'h08, A_PARAMS1 = 8'h0C,
                            A_CTRL = 8'h10, A_STATUS = 8'h14, A_ERR_CODE = 8'h18, A_CYCLES = 8'h1C,
                            A_SCRATCH = 8'h20, A_BUILD_ID = 8'h24, A_ACT_WCRC = 8'h28,
                            A_B_WCRC = 8'h2C, A_P_WCRC = 8'h30, A_LAUNCH = 8'h34,
-                           A_CMD0 = 8'h40;
+                           A_PARAMS2 = 8'h38, A_CMD0 = 8'h40,
+                           A_SEQ_CTRL = 8'h90, A_SEQ_STATUS = 8'h94, A_SEQ_ERR = 8'h98,
+                           A_DESC_WCRC = 8'h9C;
     localparam int NCMD = 19;
 
     // a word of W bits takes S = ceil(W/32) slots, padded to a power of two
@@ -183,8 +207,13 @@ module csr #(
     // saturates at 0xFFFF instead of wrapping back to a harmless-looking 0
     logic        dropped_sticky;
     logic [15:0] dropped_count;
+    // sequencer: sticky done/err of the last program, and the CRC of every
+    // descriptor word written
+    logic        seq_done_sticky, seq_err_sticky;
+    logic [15:0] desc_wcrc;
+    // busy for the host rules: a layer running, or a program between layers
     logic        busy;
-    assign busy = conv_busy;
+    assign busy = conv_busy || seq_busy;
 
     assign h_in       = cmd[0][DIM_W-1:0];
     assign w_in       = cmd[1][DIM_W-1:0];
@@ -219,7 +248,7 @@ module csr #(
     // ------------------------------------------------------------------
     // address decode, shared by reads and writes
     // ------------------------------------------------------------------
-    typedef enum logic [2:0] {R_REG, R_ACT, R_B, R_P, R_NONE} region_t;
+    typedef enum logic [2:0] {R_REG, R_ACT, R_B, R_P, R_DESC, R_CYC, R_NONE} region_t;
 
     function automatic region_t region_of(input logic [AXI_ADDR_W-1:0] a);
         if (a[23:8] == 16'h0)  return R_REG;
@@ -227,6 +256,8 @@ module csr #(
             4'h1:    return R_ACT;
             4'h2:    return R_B;
             4'h3:    return R_P;
+            4'h4:    return R_DESC;     // 2.0: descriptor words, write only
+            4'h5:    return R_CYC;      // 2.0: per-descriptor cycle counts, read only
             default: return R_NONE;
         endcase
     endfunction
@@ -284,9 +315,15 @@ module csr #(
 
     logic [AI_W-1:0] rd_idx_q;
     logic [A_SHIFT > 0 ? A_SHIFT-1 : 0:0] rd_slot_q;
-    assign host_rd_en   = (rd_state == RD_MEM);
+    logic rd_is_cyc;                        // the read in flight is the cycle RAM, not ACT
+    logic [IDX_W-1:0] rd_cyc_q;
+    assign host_rd_en   = (rd_state == RD_MEM) && !rd_is_cyc;
     assign host_rd_addr = rd_idx_q[ADDR_WIDTH-1:0];
     assign host_rd_sel  = rd_idx_q[AI_W-1 -: SEL_WIDTH];
+    // the cycle RAM is a bram with the same READ_LATENCY: the same
+    // hold-rd_en-for-READ_LATENCY-edges path reads it
+    assign cyc_rd_en    = (rd_state == RD_MEM) && rd_is_cyc;
+    assign cyc_rd_addr  = rd_cyc_q;
 
     // register read value as {mapped, value}
     function automatic logic [32:0] reg_value(input logic [7:0] off);
@@ -296,8 +333,9 @@ module csr #(
             A_PARAMS0:  return {1'b1, {8'(B_ADDR_W), 4'(NBUF), 8'(ADDR_WIDTH), 4'(READ_LATENCY), 8'(N)}};
             A_PARAMS1:  return {1'b1, {8'h0, 16'(K_MAX), 8'(P_ADDR_W)}};
             A_CTRL:     return {1'b1, {29'h0, host_mode, 2'b00}};
+            // busy and ready cover a running program too (2.0)
             A_STATUS:   return {1'b1, {dropped_count, 10'h0, dropped_sticky, host_mode, err_sticky,
-                                       done_sticky, conv_ready, conv_busy}};
+                                       done_sticky, !busy, busy}};
             A_ERR_CODE: return {1'b1, {23'h0, conv_err_code}};
             A_CYCLES:   return {1'b1, cycles};
             A_SCRATCH:  return {1'b1, scratch};
@@ -306,6 +344,12 @@ module csr #(
             A_B_WCRC:   return {1'b1, {16'h0, b_wcrc}};
             A_P_WCRC:   return {1'b1, {16'h0, p_wcrc}};
             A_LAUNCH:   return {1'b1, launch_count};
+            A_PARAMS2:  return {1'b1, {15'h0, 1'(HAS_DMA), 8'(DESC_DEPTH), 8'(M_BITS)}};
+            A_SEQ_CTRL: return {1'b1, 32'h0};
+            A_SEQ_STATUS: return {1'b1, {16'(seq_layers_done), 8'(seq_cur_index), 5'h0,
+                                         seq_err_sticky, seq_done_sticky, seq_busy}};
+            A_SEQ_ERR:  return {1'b1, {16'(seq_err_index), 5'h0, seq_err_code}};
+            A_DESC_WCRC: return {1'b1, {16'h0, desc_wcrc}};
             default: begin
                 if (off >= A_CMD0 && off < A_CMD0 + 8'(4*NCMD) && off[1:0] == 2'b00) begin
                     // ZP_IN and ZP_OUT read back sign-extended
@@ -334,6 +378,10 @@ module csr #(
             s_bvalid <= 1'b0; s_bresp <= 2'b00;
             s_rvalid <= 1'b0; s_rresp <= 2'b00; s_rdata <= '0;
             rd_state <= RD_IDLE; ar_q <= '0; rd_cnt <= '0; rd_idx_q <= '0; rd_slot_q <= '0;
+            rd_is_cyc <= 1'b0; rd_cyc_q <= '0;
+            seq_start <= 1'b0; seq_start_index <= '0;
+            seq_done_sticky <= 1'b0; seq_err_sticky <= 1'b0;
+            desc_we <= 1'b0; desc_waddr <= '0; desc_wdata <= '0; desc_wcrc <= 16'hFFFF;
             for (int i = 0; i < NCMD; i++) cmd[i] <= '0;
             scratch <= '0; cycles <= '0; launch_count <= '0;
             act_wcrc <= 16'hFFFF; b_wcrc <= 16'hFFFF; p_wcrc <= 16'hFFFF;
@@ -353,10 +401,14 @@ module csr #(
             host_we <= 1'b0;
             b_we    <= 1'b0;
             p_we    <= 1'b0;
+            seq_start <= 1'b0;
+            desc_we   <= 1'b0;
 
             // status from conv_layer. start (accepted on this edge, because
             // the CSR only starts when ready) and soft reset both clear the
             // sticky bits and the counter; the pulses set the sticky bits.
+            // these describe the legacy CTRL.start command only: while a
+            // program runs they do not move (2.0; programs use SEQ_* and CYC)
             if (conv_start && conv_ready) begin
                 cycles       <= '0;
                 launch_count <= launch_count + 1'b1;
@@ -366,10 +418,20 @@ module csr #(
                 cycles      <= '0;
                 done_sticky <= 1'b0;
                 err_sticky  <= 1'b0;
-            end else begin
-                if (busy)      cycles      <= cycles + 1'b1;
+            end else if (!seq_busy) begin
+                if (conv_busy) cycles      <= cycles + 1'b1;
                 if (conv_done) done_sticky <= 1'b1;
                 if (conv_err)  err_sticky  <= 1'b1;
+            end
+
+            // the sequencer's sticky bits: cleared by a program start and by
+            // a soft reset (which also resets the sequencer), set by its pulses
+            if (seq_start || conv_soft_reset) begin
+                seq_done_sticky <= 1'b0;
+                seq_err_sticky  <= 1'b0;
+            end else begin
+                if (seq_done) seq_done_sticky <= 1'b1;
+                if (seq_err)  seq_err_sticky  <= 1'b1;
             end
 
             // link state, not layer state: start and soft reset leave it
@@ -402,11 +464,23 @@ module csr #(
                                 conv_soft_reset <= w_q[1];
                                 host_mode       <= w_q[2];
                                 if (w_q[3]) begin
-                                    act_wcrc <= 16'hFFFF;
-                                    b_wcrc   <= 16'hFFFF;
-                                    p_wcrc   <= 16'hFFFF;
+                                    act_wcrc  <= 16'hFFFF;
+                                    b_wcrc    <= 16'hFFFF;
+                                    p_wcrc    <= 16'hFFFF;
+                                    desc_wcrc <= 16'hFFFF;
                                 end
                             end
+                        end else if (w_off == A_SEQ_CTRL) begin
+                            // a program start, refused while anything runs
+                            if (busy) s_bresp <= 2'b10;
+                            else if (w_q[0]) begin
+                                seq_start       <= 1'b1;
+                                seq_start_index <= w_q[8 +: IDX_W];
+                            end
+                        end else if (w_off == A_SEQ_STATUS) begin
+                            // W1C of the program's sticky bits, allowed while busy
+                            if (w_q[1]) seq_done_sticky <= 1'b0;
+                            if (w_q[2]) seq_err_sticky  <= 1'b0;
                         end else if (w_off == A_STATUS) begin
                             // W1C, allowed while busy
                             if (w_q[2]) done_sticky <= 1'b0;
@@ -511,6 +585,24 @@ module csr #(
                         end
                     end
 
+                    // 2.0: one 32-bit descriptor word per write, no staging
+                    R_DESC: begin
+                        if (int'(aw_q[19:2]) >= DESC_DEPTH * 16) s_bresp <= 2'b11;
+                        else if (busy)                          s_bresp <= 2'b10;
+                        else begin
+                            desc_we    <= 1'b1;
+                            desc_waddr <= aw_q[2 +: IDX_W + 4];
+                            desc_wdata <= w_q;
+                            crc_t = desc_wcrc;
+                            for (int k = 0; k < 4; k++)
+                                crc_t = crc16_byte(crc_t, w_q[k*8 +: 8]);
+                            desc_wcrc <= crc_t;
+                        end
+                    end
+
+                    // the cycle window is read only
+                    R_CYC: s_bresp <= (int'(aw_q[19:2]) >= DESC_DEPTH) ? 2'b11 : 2'b10;
+
                     default: s_bresp <= 2'b11;
                 endcase
             end
@@ -545,9 +637,30 @@ module csr #(
                                 end else begin
                                     rd_idx_q  <= r_idx_a[AI_W-1:0];
                                     rd_slot_q <= (A_SHIFT > 0) ? s_araddr[2 +: (A_SHIFT > 0 ? A_SHIFT : 1)] : '0;
+                                    rd_is_cyc <= 1'b0;
                                     rd_cnt    <= '0;
                                     rd_state  <= RD_MEM;
                                 end
+                            end
+                            // 2.0: per-descriptor cycle counts, through the same
+                            // latency-handled path as ACT
+                            R_CYC: begin
+                                if (int'(s_araddr[19:2]) >= DESC_DEPTH) begin
+                                    s_rdata <= '0; s_rresp <= 2'b11; s_rvalid <= 1'b1;
+                                end else if (busy) begin
+                                    s_rdata <= '0; s_rresp <= 2'b10; s_rvalid <= 1'b1;
+                                end else begin
+                                    rd_cyc_q  <= s_araddr[2 +: IDX_W];
+                                    rd_is_cyc <= 1'b1;
+                                    rd_cnt    <= '0;
+                                    rd_state  <= RD_MEM;
+                                end
+                            end
+                            // the descriptor window is write only
+                            R_DESC: begin
+                                s_rdata <= '0;
+                                s_rresp <= (int'(s_araddr[19:2]) >= DESC_DEPTH * 16) ? 2'b11 : 2'b10;
+                                s_rvalid <= 1'b1;
                             end
                             // B and P are write only; outside the windows is unmapped
                             R_B, R_P: begin s_rdata <= '0; s_rresp <= 2'b10; s_rvalid <= 1'b1; end
@@ -562,7 +675,8 @@ module csr #(
                 end
                 // host_rd_data now holds the word; host_rd_en is low, so it stays
                 RD_CAP: begin
-                    s_rdata  <= ((A_S*32)'(host_rd_data) >> (rd_slot_q * 32));
+                    s_rdata  <= rd_is_cyc ? cyc_rd_data
+                                          : 32'((A_S*32)'(host_rd_data) >> (rd_slot_q * 32));
                     s_rresp  <= 2'b00;
                     s_rvalid <= 1'b1;
                     rd_state <= RD_IDLE;

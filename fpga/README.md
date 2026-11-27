@@ -105,7 +105,7 @@ against `fpga/reports/utilization.rpt`.
 | resource | estimate | available | notes |
 | -------- | -------- | --------- | ----- |
 | DSP48E1 | **~86-90** | 90 | 64 PE multiply-accumulates (8x8 into 32 bits, one per PE). 16 for the 8 requants (32x17 products, two DSPs each; that is why M_WIDTH is 16). 2 for the im2col address multiplies (y*w_in, then *cin_words). About 4-6 for conv_layer's check phase (h*w, (h*w)*c_words, cout*K). **At risk.** |
-| BRAM36 | ~32 | 50 | act_buffer: 2 banks of 4096 x 64 b = 8 BRAM36 each. B: 8192 x 64 b = 16. P: 64 x 53 b goes to LUTRAM or one BRAM18 |
+| BRAM36 | ~32 | 50 | act_buffer: 2 banks of 4096 x 64 b = 8 BRAM36 each. B: 8192 x 64 b = 16. P: 64 x 53 b goes to LUTRAM or one BRAM18 (phase 3 makes it 256 x 53 b, below) |
 | LUT | ~7-10 k | 20 800 | the bulk is requant (shift and clamp per channel), im2col (N-word slice buffer and its address logic), the systolic array's skew registers, the CSR read mux and its 64-bit CRC XOR trees |
 | FF | ~9 k | 41 600 | PE accumulators (64 x 32 b) and requant pipeline registers dominate |
 
@@ -134,6 +134,20 @@ Running total at N=8: **DSP unchanged (~86-90)**, **BRAM ~40 of 50**, LUT
 ~9-12 k, FF ~10.5 k. BRAM is now the second resource to watch, after DSP.
 If it runs short, the first step is ADDR_WIDTH 12 -> 11 (each bank halves,
 -12 BRAM36), which still holds a 32x32x16 ResNet-20 map at N = 8 (2048 words).
+
+**Added by phase 3 (descriptor sequencer).** These are estimates until you run Vivado.
+
+| block | DSP | BRAM36 | LUT | FF | notes |
+| ----- | --- | ------ | --- | -- | ----- |
+| sequencer | 0 | **+0.5** (one BRAM18) | ~0.3-0.4 k | ~0.35 k | No multipliers: a descriptor's address is idx << 4. Descriptor RAM 512 x 32 b (32 descriptors) is one BRAM18. The cycle RAM, 32 x 32 b, goes to LUTRAM. A 16 x 32-bit descriptor register (only the ~150 bits in use survive synthesis), a 32-bit edge counter, and a 5-bit tag pipeline |
+| P memory, P_ADDR_W 6 -> 8 | 0 | **+1** | ~-0.1 k | 0 | 256 x 53 b moves from LUTRAM to one BRAM36, so a whole LeNet-5 keeps its requant entries on chip (sequencer contract, decision 4) |
+| csr, map 2.0 | 0 | 0 | ~0.2 k | ~0.1 k | Five more registers on the read mux, a 32-bit CRC-16 XOR tree for DESC_WCRC, and the cycle-window read through the existing READ_LATENCY path |
+| top, engine bus mux | 0 | 0 | ~0.1 k | 0 | Sequencer or legacy CSR command onto layer_engine, switched by the sequencer's busy |
+
+Running total at N=8: **DSP unchanged (~86-90)**, **BRAM ~41.5 of 50**, LUT
+~10-13 k, FF ~11 k. The sequencer is off the datapath: its fields are
+registered and sit on the engine bus for many cycles before eng_start, so it
+adds no critical path.
 
 **DSP is the resource that decides whether N=8 fits.** If utilization shows
 more than 90, or placement fails on DSPs, try these in order:

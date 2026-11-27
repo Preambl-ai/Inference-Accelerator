@@ -127,7 +127,8 @@ def parse_response(raw: Optional[bytes], read_words: int = 0) -> Tuple[int, List
 # ---------------------------------------------------------------------------
 
 ID_VALUE = 0x434E5631          # "CNV1"
-VERSION = 0x00010000
+VERSION = 0x00020000           # 2.0: descriptor sequencer; 1.x maps still work for single layers
+SUPPORTED_MAJORS = (1, 2)
 
 A_ID, A_VERSION, A_PARAMS0, A_PARAMS1 = 0x00, 0x04, 0x08, 0x0C
 A_CTRL, A_STATUS, A_ERR_CODE, A_CYCLES = 0x10, 0x14, 0x18, 0x1C
@@ -147,6 +148,54 @@ def dropped_count(status_word: int) -> int:
 
 ACT_BASE, B_BASE, P_BASE = 0x100000, 0x200000, 0x300000
 P_WIDTH = 53
+
+# map 2.0: the descriptor sequencer (sequencer/sequencer_contract.md)
+A_PARAMS2 = 0x38               # [7:0] M_BITS, [15:8] DESC_DEPTH, [16] DMA present
+A_SEQ_CTRL = 0x90              # write: [0] start, [15:8] start index
+A_SEQ_STATUS = 0x94            # [0] busy, [1] done (sticky), [2] err (sticky), [15:8] index,
+                               # [31:16] layers done; W1C on [1] and [2]
+A_SEQ_ERR = 0x98               # [31:16] index of the failing descriptor, [10:0] its code
+A_DESC_WCRC = 0x9C             # running CRC-16 over every descriptor word written
+DESC_BASE, CYC_BASE = 0x400000, 0x500000
+SEQ_START, SEQ_BUSY, SEQ_DONE, SEQ_ERR = 1, 1, 2, 4
+E_NOEND = 10
+OP_END, OP_CONV, OP_MAX2, OP_GAVG, OP_ADD = 0, 1, 2, 3, 4
+DESC_WORDS = 16
+# fields of the engine command bus, as layer_engine names them
+DESC_FIELDS = CMD_FIELDS + ("src2_sel", "src2_base", "zp_in2", "add_ma", "add_mb", "add_shift")
+
+
+def pack_descriptor(op: int, f: dict) -> List[int]:
+    """one descriptor as 16 32-bit words (sequencer contract table). missing
+    fields are 0; signed zero points are stored as two's complement bytes"""
+    g = lambda k: int(f.get(k, 0))
+    b8 = lambda v: v & 0xFF
+    w = [0] * DESC_WORDS
+    w[0] = (op & 7) | (g("relu_en") & 1) << 3 | b8(g("zp_in")) << 8 | b8(g("zp_out")) << 16 \
+        | b8(g("zp_in2")) << 24
+    w[1] = b8(g("h_in")) | b8(g("w_in")) << 8 | b8(g("h_out")) << 16 | b8(g("w_out")) << 24
+    w[2] = (g("cin_words") & 0x7F) | (g("cout_words") & 0x7F) << 8 | (g("kh") & 7) << 16 \
+        | (g("kw") & 7) << 20 | (g("stride") & 3) << 24 | (g("pad") & 3) << 28
+    w[3] = (g("src_sel") & 0xF) | (g("dst_sel") & 0xF) << 4 | (g("src2_sel") & 0xF) << 8 \
+        | (g("src_base") & 0xFFFF) << 16
+    w[4] = (g("dst_base") & 0xFFFF) | (g("src2_base") & 0xFFFF) << 16
+    w[5] = (g("b_base") & 0xFFFF) | (g("p_base") & 0xFF) << 16 | (g("add_shift") & 0xF) << 24
+    w[6] = (g("add_ma") & 0xFFFF) | (g("add_mb") & 0xFFFF) << 16
+    return w
+
+
+def unpack_descriptor(w: Sequence[int]):
+    """inverse of pack_descriptor: (op, fields), zero points sign-extended"""
+    s8 = lambda v: v - 256 if v & 0x80 else v
+    f = dict(relu_en=w[0] >> 3 & 1, zp_in=s8(w[0] >> 8 & 0xFF), zp_out=s8(w[0] >> 16 & 0xFF),
+             zp_in2=s8(w[0] >> 24 & 0xFF), h_in=w[1] & 0xFF, w_in=w[1] >> 8 & 0xFF,
+             h_out=w[1] >> 16 & 0xFF, w_out=w[1] >> 24 & 0xFF, cin_words=w[2] & 0x7F,
+             cout_words=w[2] >> 8 & 0x7F, kh=w[2] >> 16 & 7, kw=w[2] >> 20 & 7,
+             stride=w[2] >> 24 & 3, pad=w[2] >> 28 & 3, src_sel=w[3] & 0xF, dst_sel=w[3] >> 4 & 0xF,
+             src2_sel=w[3] >> 8 & 0xF, src_base=w[3] >> 16, dst_base=w[4] & 0xFFFF,
+             src2_base=w[4] >> 16, b_base=w[5] & 0xFFFF, p_base=w[5] >> 16 & 0xFF,
+             add_shift=w[5] >> 24 & 0xF, add_ma=w[6] & 0xFFFF, add_mb=w[6] >> 16)
+    return w[0] & 7, f
 
 
 def slot_shift(width: int) -> int:
@@ -177,12 +226,17 @@ class HwInfo:
     b_addr_w: int
     p_addr_w: int
     k_max: int
+    version: int = VERSION
+    m_bits: int = 8                 # from PARAMS2 (map 2.x)
+    desc_depth: int = 0             # 0: no sequencer (map 1.x)
+    has_dma: int = 0
 
     @classmethod
-    def decode(cls, p0: int, p1: int) -> "HwInfo":
+    def decode(cls, p0: int, p1: int, p2: int = 0, version: int = VERSION) -> "HwInfo":
         return cls(n=p0 & 0xFF, read_latency=(p0 >> 8) & 0xF, addr_width=(p0 >> 12) & 0xFF,
                    nbuf=(p0 >> 20) & 0xF, b_addr_w=(p0 >> 24) & 0xFF, p_addr_w=p1 & 0xFF,
-                   k_max=(p1 >> 8) & 0xFFFF)
+                   k_max=(p1 >> 8) & 0xFFFF, version=version,
+                   m_bits=(p2 & 0xFF) or 8, desc_depth=(p2 >> 8) & 0xFF, has_dma=(p2 >> 16) & 1)
 
     @property
     def word_w(self): return 8 * self.n
@@ -367,10 +421,13 @@ def identify(stats):
         raise RuntimeError(f"ID register reads {ident:#010x}, expected {ID_VALUE:#010x} "
                            f"(wrong board or bitstream)")
     version = yield from read32(A_VERSION, stats)
-    if version >> 16 != VERSION >> 16:
-        raise RuntimeError(f"CSR map version {version:#010x}, this host speaks {VERSION:#010x}")
+    if version >> 16 not in SUPPORTED_MAJORS:
+        raise RuntimeError(f"CSR map version {version:#010x}, this host speaks majors "
+                           f"{SUPPORTED_MAJORS}")
     p0 = yield from read32(A_PARAMS0, stats)
     p1 = yield from read32(A_PARAMS1, stats)
+    # map 2.x adds PARAMS2 (sequencer depth, add multiplier width); 1.x has none
+    p2 = (yield from read32(A_PARAMS2, stats)) if version >> 16 >= 2 else 0
     build = yield from read32(A_BUILD_ID, stats)
     # a DROPPED count left over from an earlier session is history: report it
     # (stats.stale_dropped) and clear it, so any count from now on is ours
@@ -378,7 +435,76 @@ def identify(stats):
     if st & ST_DROPPED:
         stats.stale_dropped = dropped_count(st)
         yield from write32(A_STATUS, ST_DROPPED, stats)
-    return HwInfo.decode(p0, p1), build
+    return HwInfo.decode(p0, p1, p2, version), build
+
+
+# ---------------------------------------------------------------------------
+# programs (map 2.x): descriptors, the sequencer, per-layer cycles
+# ---------------------------------------------------------------------------
+
+def load_program(descs: Sequence[Sequence[int]], first: int, stats):
+    """write descriptors (16 words each) from index `first` in one burst per
+    256 words, and check the board's descriptor CRC (cleared by clear_wcrc)"""
+    words = [w for d in descs for w in d]
+    for attempt in range(LOAD_TRIES):
+        yield from write32(A_CTRL, CTRL_CLEAR_WCRC, stats)
+        yield from burst_write(DESC_BASE + first * DESC_WORDS * 4, words, stats)
+        got = yield from read32(A_DESC_WCRC, stats)
+        want = 0xFFFF
+        for w in words:
+            want = crc16(w.to_bytes(4, "little"), want)
+        if got == want:
+            return attempt + 1
+        stats.reloads += 1
+    raise RuntimeError(f"descriptor CRC {got:#06x}, host computed {want:#06x}")
+
+
+@dataclass
+class ProgramResult:
+    status: int                 # SEQ_STATUS at the end
+    layers_done: int
+    err_index: int
+    err_code: int               # 0 if the program reached END
+    cycles: List[int]           # per finished descriptor, from the CYC window
+    polls: int
+
+
+def start_program(first: int, stats):
+    """start the sequencer exactly once. its sticky bits are cleared first, so
+    after a lost answer 'busy, or done/err set' means the start took"""
+    yield from write32(A_SEQ_STATUS, SEQ_DONE | SEQ_ERR, stats)
+    pkt = pkt_write32(A_SEQ_CTRL, SEQ_START | (first & 0xFF) << 8)
+    for _ in range(RETRIES):
+        status, _ = yield from transact(pkt, 0, stats, retry=False)
+        if status == ST_OK:
+            return
+        if status in (ST_SLVERR, ST_DECERR):
+            raise BusError(status, A_SEQ_CTRL)
+        yield WaitIdle()
+        st = yield from read32(A_SEQ_STATUS, stats)
+        if st & (SEQ_BUSY | SEQ_DONE | SEQ_ERR):
+            return                  # it took; only the answer was lost
+        stats.retries += 1
+    raise LinkError("program start did not take")
+
+
+def run_program(first: int, stats, max_polls: int = 1_000_000):
+    """start, poll SEQ_STATUS until done or err, then read the first error and
+    the cycle count of every finished descriptor"""
+    yield from start_program(first, stats)
+    for i in range(max_polls):
+        st = yield from read32(A_SEQ_STATUS, stats)
+        if st & (SEQ_DONE | SEQ_ERR):
+            break
+    else:
+        raise RuntimeError("program did not finish")
+    yield from check_dropped(stats)
+    err = yield from read32(A_SEQ_ERR, stats)
+    layers = st >> 16
+    cycles = []
+    if layers:
+        cycles = yield from burst_read(CYC_BASE + 4 * first, layers, stats)
+    return ProgramResult(st, layers, err >> 16, err & 0x7FF if st & SEQ_ERR else 0, cycles, i + 1)
 
 
 def check_dropped(stats):
@@ -615,6 +741,35 @@ if __name__ == "__main__":
     run_sync(start(st), t)
     starts = sum(1 for pkt in t.sent if pkt == pkt_write32(A_CTRL, CTRL_START))
     chk("start repeated when LAUNCH_COUNT did not move", starts, 2)
+
+    # descriptors: every field survives a round trip at its width extremes
+    import random as _r
+    rr = _r.Random(9)
+    for i in range(200):
+        f = dict(relu_en=rr.randint(0, 1), zp_in=rr.randint(-128, 127), zp_out=rr.randint(-128, 127),
+                 zp_in2=rr.randint(-128, 127), h_in=rr.randint(0, 255), w_in=rr.randint(0, 255),
+                 h_out=rr.randint(0, 255), w_out=rr.randint(0, 255), cin_words=rr.randint(0, 127),
+                 cout_words=rr.randint(0, 127), kh=rr.randint(0, 7), kw=rr.randint(0, 7),
+                 stride=rr.randint(0, 3), pad=rr.randint(0, 3), src_sel=rr.randint(0, 15),
+                 dst_sel=rr.randint(0, 15), src2_sel=rr.randint(0, 15), src_base=rr.randint(0, 65535),
+                 dst_base=rr.randint(0, 65535), src2_base=rr.randint(0, 65535),
+                 b_base=rr.randint(0, 65535), p_base=rr.randint(0, 255), add_shift=rr.randint(0, 15),
+                 add_ma=rr.randint(0, 65535), add_mb=rr.randint(0, 65535))
+        op = rr.randint(0, 7)
+        w = pack_descriptor(op, f)
+        if (len(w), unpack_descriptor(w)) != (DESC_WORDS, (op, f)) or any(x >> 32 for x in w) \
+                or any(w[7:]):
+            chk(f"descriptor round trip #{i}", unpack_descriptor(w), (op, f))
+            break
+    else:
+        chk("descriptor round trip, 200 random descriptors", True, True)
+    chk("END descriptor is all zero", pack_descriptor(OP_END, {}), [0] * DESC_WORDS)
+    # program start: answer lost but SEQ_STATUS shows it ran -> no second start
+    st = LinkStats()
+    t = Scripted([build_response(ST_OK), None, clean, build_response(ST_OK, [SEQ_DONE | (3 << 16)])])
+    run_sync(start_program(0, st), t)
+    chk("program start not repeated when it took",
+        sum(1 for p in t.sent if p == pkt_write32(A_SEQ_CTRL, SEQ_START)), 1)
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)

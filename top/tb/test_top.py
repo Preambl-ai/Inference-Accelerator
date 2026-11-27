@@ -7,6 +7,11 @@ driver uses: the sequences in protocol.py run here through run_async over a
 cocotb transport, and over pyserial on the bench. Expected results come from
 the conv_layer NumPy model (conv_ref through host/layers.py).
 
+Programs (map 2.0): host/network.py builds a random multi-layer network and
+its expected words and cycles (sequencer_model over the conv, pool and add
+models); network.board_run is the same load / program / run / read-back
+sequence run_network.py sends to the board.
+
 Fault injection lives in the transport: a hook can flip or drop one byte of a
 chosen request, or garble a response, and the tests check that the bridge's
 answer and the host's retry logic deal with it.
@@ -21,10 +26,17 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 from cocotb.utils import get_sim_time
 import numpy as np
 
+import network as NET
 import protocol as P
 from conv_layer_model import (E_HOST, E_SEL, Layer, check_command, err_names, estimate_cycles,
                               k_of, random_layer, requant_params)
 from layers import expected, hw_params, layer_images
+
+
+def rand_words(rng, n, count):
+    """count random act words of n bytes; from bytes, so N = 8 (2^64) fits"""
+    b = rng.bytes(n * count)
+    return [int.from_bytes(b[i * n:(i + 1) * n], "little") for i in range(count)]
 
 
 class UartTransport:
@@ -135,7 +147,7 @@ class TopHarness:
     # -- act_buffer contents through the UART ----------------------------------
     async def fill_bank(self, bank, words=None):
         depth = 1 << self.hw.addr_width
-        words = words if words is not None else [int(v) for v in self.rng.integers(0, 1 << (8 * self.n), depth)]
+        words = words if words is not None else rand_words(self.rng, self.n, depth)
         imgs = P.memory_images(self.hw, act=[(bank, 0, words)])
         await self.run(P.load(self.hw, imgs, self.stats))
         for i, w in enumerate(words):
@@ -425,18 +437,20 @@ async def test_bus_errors_and_refusals(dut):
     assert st == P.ST_SLVERR, f"burst over a read-only register: {P.STATUS_NAMES.get(st, st)}"
     assert await h.run(P.read32(P.A_SCRATCH, h.stats)) == 0x5C5C, "the word before the error was lost"
     assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1, "a burst kept writing after SLVERR"
-    # unmapped first word (0x38): DECERR, and H_IN/W_IN two words on stay untouched
-    st, _ = await h.raw(P.pkt_burst_write(0x38, [7, 7, 9, 9]))
+    # unmapped first word (0x3C, the hole before the command; 0x38 is PARAMS2
+    # since map 2.0): DECERR, and H_IN/W_IN one and two words on stay untouched
+    st, _ = await h.raw(P.pkt_burst_write(0x3C, [7, 7, 9, 9]))
     assert st == P.ST_DECERR
     assert await h.run(P.read32(P.A_CMD0, h.stats)) == 1 and \
         await h.run(P.read32(P.A_CMD0 + 4, h.stats)) == 1, "a burst kept writing after DECERR"
-    # -- reads: LAUNCH_COUNT (ok), 0x38 (DECERR), 0x3C, H_IN: zeros from the error on
+    # -- reads: LAUNCH_COUNT, PARAMS2 (ok), 0x3C (DECERR), H_IN: zeros from the error on
     launches = await h.run(P.read32(P.A_LAUNCH, h.stats))
+    params2 = await h.run(P.read32(P.A_PARAMS2, h.stats))
     st, words = await h.raw(P.pkt_burst_read(P.A_LAUNCH, 4), 4)
-    assert (st, words) == (P.ST_DECERR, [launches, 0, 0, 0]), \
+    assert (st, words) == (P.ST_DECERR, [launches, params2, 0, 0]), \
         f"DECERR mid burst read: {P.STATUS_NAMES.get(st, st)} {words}"
     # -- ACT refusals by host_mode, on the real act_buffer
-    word = [int(h.rng.integers(0, 1 << (8 * h.n)))]
+    word = rand_words(h.rng, h.n, 1)
     st, _ = await h.raw(P.pkt_burst_write(h.hw.act_addr(1, 3), word))
     assert st == P.ST_SLVERR, "ACT write without host_mode was accepted"
     await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
@@ -477,7 +491,7 @@ async def test_dropped_bytes_mid_answer(dut):
     t, clk = h.t, dut.CLK100MHZ
     st = await h.run(P.check_dropped(h.stats))
     assert not st & P.ST_DROPPED, "DROPPED set on a clean link"
-    words_in = [int(v) for v in h.rng.integers(0, 1 << (8 * h.n), 64)]
+    words_in = rand_words(h.rng, h.n, 64)
     await h.run(P.write32(P.A_CTRL, P.CTRL_HOST_MODE, h.stats))
     await h.run(P.burst_write(h.hw.act_addr(0, 0), words_in, h.stats))
     await h.run(P.write32(P.A_CTRL, 0, h.stats))
@@ -628,3 +642,93 @@ async def test_busy_refusals_and_soft_reset(dut):
     # the destination may now hold any mix of old and new words; a clean
     # rerun must leave exactly the right output and nothing else changed
     await h.run_layer(layer, "rerun after soft reset", with_act=False)
+
+
+# ---------------------------------------------------------------------------- map 2.0
+
+async def run_net(h, net, first, name):
+    """load, run and check a whole program through the pins"""
+    res = await h.run(NET.board_run(h.hw, net, first, h.stats))
+    ok, lines = NET.compare(net, res)
+    for line in lines:
+        h.dut._log.info(f"{name}: {line}")
+    assert ok, f"{name}: the board's program differs from the model {h.where()}"
+    h.dut._log.info(f"{name}: {res.program.layers_done} layers match, SEQ_STATUS "
+                    f"{res.program.status:#x}, {res.program.polls} polls, link {h.stats}")
+    return res
+
+
+@cocotb.test()
+async def test_network_program(dut):
+    """a multi-layer network (conv, max pool, a ResNet basic block with its
+    residual add, 1x1 conv, global average) runs from one SEQ_CTRL start with
+    no host work between layers; every layer's output and cycle count match
+    NumPy and the cycle formulas; the program runs again from another
+    descriptor index; the legacy single-layer command still works after it"""
+    h = await fresh(dut)
+    assert h.hw.version >> 16 == 2 and h.hw.desc_depth > 0, f"map 2.0 expected: {h.hw}"
+    net = NET.build(h.rng, hw_params(h.hw), m_bits=h.hw.m_bits, plan=["conv3", "max2", "res",
+                    "conv1", "gavg"], h=4, w=4, read_latency=h.lat, desc_depth=h.hw.desc_depth)
+    await run_net(h, net, 0, "program from 0")
+    first = h.hw.desc_depth - len(net.descriptors)
+    await run_net(h, net, first, f"same program from {first}")
+    # the legacy command after programs: a conv on bank 0 -> 1
+    for bank in range(h.hw.nbuf):
+        await h.fill_bank(bank)
+    await h.run_layer(small_layer(h, src_sel=0, dst_sel=1), "legacy layer after programs")
+
+
+@cocotb.test()
+async def test_program_error(dut):
+    """a bad descriptor stops the program there: SEQ_STATUS err, SEQ_ERR has
+    its index and the engine's E_MODE, the layers before it are complete and
+    right, and the cycle window holds their counts"""
+    h = await fresh(dut)
+    net = NET.build(h.rng, hw_params(h.hw), m_bits=h.hw.m_bits, plan=["conv3", "max2", "conv1",
+                    "conv3"], h=4, w=4, read_latency=h.lat, desc_depth=h.hw.desc_depth)
+    bad = 2
+    net.descriptors[bad] = [(net.descriptors[bad][0] & ~7) | 7] + net.descriptors[bad][1:]
+    res = await h.run(NET.board_run(h.hw, net, 0, h.stats))
+    pr = res.program
+    assert pr.status & P.SEQ_ERR and not pr.status & P.SEQ_DONE, f"SEQ_STATUS {pr.status:#x}"
+    assert (pr.err_index, pr.err_code, pr.layers_done) == (bad, 1 << 9, bad), \
+        f"SEQ_ERR index {pr.err_index} code {pr.err_code:#x}, {pr.layers_done} layers done"
+    e = net.expected
+    assert res.outputs == e.outputs[:bad] and pr.cycles == e.cycles[:bad], \
+        "the layers before the bad descriptor differ from the model"
+    dut._log.info(f"bad op at descriptor {bad}: SEQ_ERR code {pr.err_code:#x} (E_MODE), "
+                  f"{pr.layers_done} layers done and right")
+
+
+@cocotb.test()
+async def test_program_busy_and_soft_reset(dut):
+    """while a program runs: SEQ_STATUS reads busy with the running index;
+    the legacy start, a second program start, descriptor writes, cycle-window
+    reads and memory writes are refused; soft reset stops the program; a
+    clean rerun matches NumPy"""
+    h = await fresh(dut)
+    c = 3 * h.n
+    net = NET.build(h.rng, hw_params(h.hw), m_bits=h.hw.m_bits, plan=[f"conv3:{c}"] * 3,
+                    h=6, w=6, c=c, read_latency=h.lat, desc_depth=h.hw.desc_depth)
+    await h.run(P.load(h.hw, NET.images(h.hw, net), h.stats))
+    await h.run(P.load_program(net.descriptors, 0, h.stats))
+    # the board is not reset between tests: clear the legacy done/err an
+    # earlier test's layer left, so a program that set them would show
+    await h.run(P.write32(P.A_STATUS, P.ST_DONE | P.ST_ERR, h.stats))
+    await h.run(P.start_program(0, h.stats))
+    st = await h.run(P.read32(P.A_SEQ_STATUS, h.stats))
+    assert st & P.SEQ_BUSY, f"program finished before the busy checks: {st:#x}"
+    for pkt in (P.pkt_write32(P.A_CTRL, P.CTRL_START), P.pkt_write32(P.A_SEQ_CTRL, P.SEQ_START),
+                P.pkt_write32(P.DESC_BASE, 0), P.pkt_burst_write(h.hw.b_addr(0), [1, 2]),
+                P.pkt_write32(P.A_CMD0, 1)):
+        s, _ = await h.raw(pkt)
+        assert s == P.ST_SLVERR, f"accepted while a program runs: {P.STATUS_NAMES.get(s, s)}"
+    s, _ = await h.raw(P.pkt_burst_read(P.CYC_BASE, 1), 1)
+    assert s == P.ST_SLVERR, "cycle window read while a program runs"
+    st = await h.run(P.read32(P.A_STATUS, h.stats))
+    assert st & P.ST_BUSY and not st & (P.ST_DONE | P.ST_ERR), \
+        f"legacy STATUS {st:#x} while a program runs: busy, and no layer's done/err"
+    await h.run(P.write32(P.A_CTRL, P.CTRL_SOFT_RESET, h.stats))
+    st = await h.run(P.read32(P.A_SEQ_STATUS, h.stats))
+    assert st & 0x7 == 0, f"SEQ_STATUS {st:#x} after soft reset: not idle"
+    await run_net(h, net, 0, "rerun after soft reset")
