@@ -87,6 +87,22 @@ at their usual widths (16/32/64) do not. Those are what phase 4's DMA is for:
 B and P come from DDR per output group, and the on-chip B/P become a cache
 of one layer.
 
+### 5. DESC_DEPTH on the board (phase 4)
+
+ResNet-20 is 32 layers once each residual block is split into its convs and
+its add (the downsampling blocks add a 1x1 skip conv). With END that is 33
+descriptors, one more than the 32 of phase 3.
+
+| | keep 32, run ResNet-20 as two programs | **64 (chosen)** |
+| --- | --- | --- |
+| cost | none in RTL | descriptor RAM 1024 x 32 b = one BRAM36 (was one BRAM18): +0.5 BRAM36; cycle RAM 128 x 32 b, still LUTRAM |
+| host work | the host starts the second half: a per-network step, against the goal | none |
+| ceiling | - | PARAMS2 reports DESC_DEPTH in 8 bits: 128 without a map change |
+
+**Chosen: DESC_DEPTH = 64 in top.** The sequencer itself is unchanged
+(IDX_W follows the parameter), and the CSR's DESC and CYC windows size from
+it. A host reads DESC_DEPTH from PARAMS2 and does not assume 32.
+
 ## Ports
 
 | group | ports |

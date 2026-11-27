@@ -14,6 +14,10 @@ networks are built with weights "mixed" (SEQ_WEIGHTS overrides: chip, ddr,
 mixed): each conv's B and P come from DDR or were loaded on chip. The
 fetch counts in the second half of the cycle RAM are checked against the
 wdma formula when the slave does not stall.
+
+test_full_network runs one of the fixed plans at full size (32x32x3 input):
+NET_PLAN=lenet, resnet8 or resnet20 (network.LENET / RESNET8 / RESNET20);
+without NET_PLAN it does nothing. sweep-net runs all three.
 """
 
 import os
@@ -251,6 +255,31 @@ async def test_lenet_and_resnet_program(dut):
     per = (ov - 1) / len(net.steps)
     dut._log.info(f"MEASURED sequencer overhead: {ov} edges for {len(net.steps)} descriptors "
                   f"(incl. END) = {per:.2f} per descriptor + 1")
+
+
+PLANS = {"lenet": NET.LENET, "resnet8": NET.RESNET8, "resnet20": NET.RESNET20}
+
+
+@cocotb.test()
+async def test_full_network(dut):
+    """LeNet-5, ResNet-8 or ResNet-20 (NET_PLAN) on a 32x32x3 input, from one
+    start: every layer whose output survives to the end matches NumPy, every
+    layer's cycle count its formula, every fetch the wdma formula (no
+    stall); activation space is reused (keep="last"), so earlier outputs are
+    checked through the banks they leave behind"""
+    name = os.environ.get("NET_PLAN")
+    if not name:
+        return
+    t = await fresh(dut)
+    net = t.netb(PLANS[name], h=32, w=32, c=3, keep="last")
+    n_ddr = sum(1 for s in net.steps if s.fields.get("w_ddr"))
+    await t.load(net)
+    kind, edges, starts = await t.run_program(limit=10_000_000)
+    assert starts == len(net.steps) - 1, f"{starts} engine starts for {len(net.steps) - 1} layers"
+    ov = await t.check_network(net, 0, kind, edges, starts, name)
+    dut._log.info(f"NETWORK {name}: {len(net.steps) - 1} layers, {n_ddr} with DDR weights, "
+                  f"{edges} edges start to done (layers {sum(net.expected.cycles)}, fetches "
+                  f"{sum(net.expected.fetch_cycles)}, sequencer {ov})")
 
 
 @cocotb.test()
