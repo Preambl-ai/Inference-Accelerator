@@ -46,6 +46,7 @@ class Axi4Slave:
         self.max_out = max_outstanding
         self.rng = random.Random(seed)
         self.bad = bad or (lambda addr: False)       # addr -> True: answer SLVERR
+        self.bad_id = None                           # addr -> True: answer RID 1 (OKAY data)
         self.log = log
         self.errors = []
         self.ar_log = []          # (addr, beats) of every accepted AR, in order
@@ -173,12 +174,13 @@ class Axi4Slave:
                 last = rd[1] == 0
                 if last:
                     self.reads.popleft()
-                self.r_cur = (self.word(addr), SLVERR if self.bad(addr) else OKAY, last)
+                self.r_cur = (self.word(addr), SLVERR if self.bad(addr) else OKAY, last,
+                              int(bool(self.bad_id and self.bad_id(addr))))
             if self.r_cur is not None:
                 self._set("rdata", self.r_cur[0])
                 self._set("rresp", self.r_cur[1])
                 self._set("rlast", int(self.r_cur[2]))
-                self._set("rid", 0)
+                self._set("rid", self.r_cur[3])
                 self._set("rvalid", 1)
             else:
                 self._set("rvalid", 0)

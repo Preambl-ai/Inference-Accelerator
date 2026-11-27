@@ -39,6 +39,9 @@ class WdmaTB:
                                b_latency=self.lat, seed=self.seed, bad=self.bad)
         self.slave.mem[:] = bytes(self.rng.getrandbits(8) for _ in range(MEM))
         self.writes = []        # (edge, kind, waddr, data)
+        self.ar_hs = []         # edges with an AR handshake
+        self.arvalid = set()    # edges at which ARVALID was up
+        self.pulses = []        # (edge, "done" / "err")
         self.edge = 0
 
     def bad(self, addr):
@@ -70,6 +73,15 @@ class WdmaTB:
             await RisingEdge(d.clk)
             self.edge += 1
             await ReadOnly()
+            # values on the wires now are what the next edge samples
+            if int(d.arvalid.value):
+                self.arvalid.add(self.edge + 1)
+                if int(d.arready.value):
+                    self.ar_hs.append(self.edge + 1)
+            if int(d.f_done.value):
+                self.pulses.append((self.edge, "done"))
+            if int(d.f_err.value):
+                self.pulses.append((self.edge, "err"))
             if int(d.b_we.value):
                 self.writes.append((self.edge, "b", int(d.b_waddr.value), int(d.b_wdata.value)))
             if int(d.p_we.value):
@@ -117,7 +129,9 @@ class WdmaTB:
 
     async def run(self, f: Fetch, name, abort_at=None):
         d = self.dut
-        exp = fetch(self.slave.mem, f, self.n, self.b_aw, self.p_aw, bad=self.bad)
+        bid = self.slave.bad_id
+        exp = fetch(self.slave.mem, f, self.n, self.b_aw, self.p_aw,
+                    bad=lambda a: self.bad(a) or bool(bid and bid(a)))     # E_RESP either way
         n_ar, n_w = len(self.slave.ar_log), len(self.writes)
         await FallingEdge(d.clk)
         assert int(d.f_ready.value), "harness: wdma not ready"
@@ -134,11 +148,8 @@ class WdmaTB:
         got_p = [(a, v) for _, k, a, v in self.writes[n_w:] if k == "p"]
         bursts = self.slave.ar_log[n_ar:]
         if res[0] == "abort":
-            abort_edge = start_edge + abort_at - 1
-            late = [w for w in self.writes[n_w:] if w[0] > abort_edge]
-            assert not late, f"{name}: {len(late)} writes after the abort edge {self.where()}"
-            assert got_b == exp.b_writes[:len(got_b)] and got_p == exp.p_writes[:len(got_p)], \
-                f"{name}: writes before the abort differ from the model"
+            # abort goes up before the abort_at-th edge after the accepting one
+            abort_edge = start_edge + abort_at
             # busy until the burst in flight is drained, then idle and quiet
             for _ in range(20000):
                 await RisingEdge(d.clk)
@@ -148,6 +159,20 @@ class WdmaTB:
             assert int(d.f_ready.value), "wdma did not go idle after abort"
             assert self.slave.idle(), "wdma went idle with AXI beats still owed"
             await FallingEdge(d.clk)
+            await FallingEdge(d.clk)            # the monitor has seen the last edge
+            # checked over the whole drain, not just up to the abort edge (a
+            # mutation run found an abort that was forgotten after one cycle)
+            got_b = [(a, v) for _, k, a, v in self.writes[n_w:] if k == "b"]
+            got_p = [(a, v) for _, k, a, v in self.writes[n_w:] if k == "p"]
+            late = [w for w in self.writes[n_w:] if w[0] > abort_edge]
+            assert not late, f"{name}: {len(late)} writes after the abort edge {self.where()}"
+            assert got_b == exp.b_writes[:len(got_b)] and got_p == exp.p_writes[:len(got_p)], \
+                f"{name}: writes before the abort differ from the model"
+            pulses = [p for p in self.pulses if p[0] > abort_edge]
+            assert not pulses, f"{name}: {pulses[0][1]} after the abort {self.where()}"
+            # an AR already up at the abort edge may complete; no new one may start
+            new_ar = [e for e in self.ar_hs if e > abort_edge and abort_edge not in self.arvalid]
+            assert not new_ar, f"{name}: a burst started after the abort edge {self.where()}"
             d._log.info(f"ABORT {name}: at edge {abort_at}, {len(got_b)} B + {len(got_p)} P words "
                         f"before it, {len(bursts)} bursts")
             return res
@@ -178,6 +203,7 @@ class WdmaTB:
             await ReadOnly()
             if int(d.h_ack.value):
                 r = (int(d.h_resp.value), int(d.h_rdata.value))
+                self.host_edges = t + 2          # from the edge that took h_req to h_ack
                 await FallingEdge(d.clk)
                 return r
         raise AssertionError("no h_ack")
@@ -240,6 +266,7 @@ async def test_errors(dut):
         ("groups = 0", Fetch(0, MEM // 2, 4, 0, 0, 0)),
         ("b_src misaligned", Fetch(4, MEM // 2, 4, 1, 0, 0)),
         ("p_src misaligned and k = 0", Fetch(0, MEM // 2 + 2, 0, 1, 0, 0)),
+        ("p_src misaligned alone", Fetch(0, MEM // 2 + 4, 4, 1, 0, 0)),
         ("B overflows in group 2", Fetch(0, MEM // 2, 50, 5, (1 << t.b_aw) - 120, 0)),
         ("P overflows in group 1", Fetch(0, MEM // 2, 3, 3, 0, (1 << t.p_aw) - n - 1)),
     ]
@@ -252,6 +279,12 @@ async def test_errors(dut):
     await t.run(Fetch(0x4000, MEM // 2, 20, 3, 0, 0), "SLVERR on group 1's first P entry")
     t.bad_ranges = []
     await t.run(t.legal(), "clean after the slave errors")
+    # a wrong RID with OKAY data, mid-burst and on the last beat
+    for beat_i, what in ((7, "beat 8 of 20"), (19, "the last beat")):
+        t.slave.bad_id = lambda a, x=0x4000 + 8 * beat_i: a == x
+        await t.run(Fetch(0x4000, MEM // 2, 20, 2, 0, 0), f"RID 1 on {what} (group 0)")
+    t.slave.bad_id = None
+    await t.run(t.legal(), "clean after the RID errors")
 
 
 @cocotb.test()
@@ -281,18 +314,26 @@ async def test_host_access(dut):
     """single-beat writes to both halves of a word (only that half changes),
     reads back, SLVERR from the slave for writes and reads, a fetch after"""
     t = await fresh(dut)
+    w_edges, r_edges = set(), set()
     for i in range(40):
         addr = 4 * t.rng.randrange(0, MEM // 4)
         v = t.rng.getrandbits(32)
         before = beat(t.slave.mem, addr & ~7)
         resp, _ = await t.host(1, addr, v)
+        w_edges.add(t.host_edges)
         assert resp == OKAY, f"host write {addr:#x}: resp {resp}"
         after = beat(t.slave.mem, addr & ~7)
         sh = 32 if addr & 4 else 0
         keep = ~(0xFFFFFFFF << sh) & (2**64 - 1)
         assert after == (before & keep) | (v << sh), f"host write {addr:#x}: word {after:#x}"
         resp, got = await t.host(0, addr)
+        r_edges.add(t.host_edges)
         assert (resp, got) == (OKAY, v), f"host read {addr:#x}: ({resp}, {got:#x}), wrote {v:#x}"
+    if t.stall == 0:
+        assert len(w_edges) == 1 and len(r_edges) == 1, \
+            f"host access time varies with no backpressure: writes {w_edges}, reads {r_edges}"
+    dut._log.info(f"LATENCY host single beat, AXI_LAT={t.lat} B latency {t.slave.b_latency}: "
+                  f"write {sorted(w_edges)} edges, read {sorted(r_edges)} edges (h_req edge to h_ack)")
     t.bad_ranges = [(0x100, 0x108)]
     before = bytes(t.slave.mem[0x100:0x108])
     assert (await t.host(1, 0x104, 0x1234))[0] == SLVERR
