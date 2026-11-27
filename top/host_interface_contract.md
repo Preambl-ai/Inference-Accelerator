@@ -200,10 +200,10 @@ DECERR. Refused accesses answer SLVERR and change nothing.
 | addr | name | access | reset | fields |
 | ---- | ---- | ------ | ----- | ------ |
 | 0x00 | ID | RO | 0x434E_5631 ("CNV1") | fixed. The host reads this first and stops on a mismatch |
-| 0x04 | VERSION | RO | 0x0002_0000 | [31:16] major, [15:0] minor of this map. **2.0** adds the descriptor sequencer (PARAMS2, SEQ_*, DESC_WCRC, the DESC and CYC windows). Every 1.x register keeps its address and meaning, so a 1.x host (single layers) still works on a 2.0 board, and the host tells the two apart by the major |
+| 0x04 | VERSION | RO | 0x0002_0100 | [31:16] major, [15:0] minor of this map. **2.0** adds the descriptor sequencer (PARAMS2, SEQ_*, DESC_WCRC, the DESC and CYC windows). **2.1** adds weights from DDR (DDR_BASE, DDR_WCRC, the DDR window, the fetch half of CYC, wdma's bits in SEQ_ERR); a 2.0 host still works on a 2.1 board. Every 1.x register keeps its address and meaning, so a 1.x host (single layers) still works on a 2.0 board, and the host tells the two apart by the major |
 | 0x08 | PARAMS0 | RO | from parameters | [7:0] N, [11:8] READ_LATENCY, [19:12] ADDR_WIDTH, [23:20] NBUF, [31:24] B_ADDR_W |
 | 0x0C | PARAMS1 | RO | from parameters | [7:0] P_ADDR_W, [23:8] K_MAX |
-| 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses the `reset` of layer_engine and (2.0) the sequencer for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets every *_WCRC (ACT, B, P and, 2.0, DESC) to 0xFFFF, reads 0 |
+| 0x10 | CTRL | RW | 0 | [0] start: write 1 pulses `start` for one cycle, reads 0. [1] soft_reset: write 1 pulses the `reset` of layer_engine and (2.0) the sequencer for one cycle, reads 0. [2] host_mode: level, read/write. [3] clear_wcrc: write 1 sets every *_WCRC (ACT, B, P and, 2.0, DESC, 2.1, DDR) to 0xFFFF, reads 0 |
 | 0x14 | STATUS | RO / W1C | 0x2 | [0] busy, [1] ready, [2] done (sticky), [3] err (sticky), [4] host_mode, [5] DROPPED (sticky), [31:16] DROPPED_COUNT. Writing 1 to [2] or [3] clears it; start and soft reset also clear both. Writing 1 to [5] clears DROPPED and DROPPED_COUNT together; nothing else clears them except the board reset (they are link state, not layer state) |
 
 **DROPPED / DROPPED_COUNT.** The bridge pulses once for every byte that
@@ -231,8 +231,10 @@ never sends before the answer is in:
 | 0x38 | PARAMS2 (2.0) | RO | from parameters | [7:0] M_BITS (add rescale width), [15:8] DESC_DEPTH, [16] DMA present (phase 4) |
 | 0x90 | SEQ_CTRL (2.0) | WO | - | write [0] = 1: start the program at descriptor [15:8]. Refused (SLVERR) while busy. Reads as 0 |
 | 0x94 | SEQ_STATUS (2.0) | RO / W1C | 0 | [0] sequencer busy, [1] done (sticky), [2] err (sticky), [15:8] current descriptor, [31:16] layers finished in this program. Writing 1 to [1] or [2] clears it; a program start clears both |
-| 0x98 | SEQ_ERR (2.0) | RO | 0 | [31:16] index of the descriptor that failed, [10:0] its code: bits 0-9 are the engine's error bits, bit 10 is E_NOEND |
+| 0x98 | SEQ_ERR (2.0) | RO | 0 | [31:16] index of the descriptor that failed, [15:0] its code: bits 0-9 are the engine's error bits, bit 10 is E_NOEND; 2.1: bits 14:11 are wdma's E_DIM, E_ALIGN, E_RANGE, E_RESP, bit 15 E_NODMA (a DDR layer in a build without wdma) |
 | 0x9C | DESC_WCRC (2.0) | RO | 0xFFFF | running CRC-16 over every descriptor word written, 4 bytes LSB first; cleared by CTRL.clear_wcrc |
+| 0xA0 | DDR_BASE (2.1) | RW | 0 | [31:23]: the DDR byte address the DDR window starts at (8 MB pages); [22:0] read 0. Writes are refused while busy. DECERR when the build has no wdma |
+| 0xA4 | DDR_WCRC (2.1) | RO | 0xFFFF | running CRC-16 over every DDR window word written that DDR accepted, 4 bytes LSB first; cleared by CTRL.clear_wcrc. DECERR when the build has no wdma |
 | 0x40 .. 0x88 | command | RW | 0 | one field per register, low bits, in this order: H_IN, W_IN, H_OUT, W_OUT, CIN_WORDS, COUT_WORDS, KH, KW, STRIDE, PAD, ZP_IN, ZP_OUT, RELU_EN, SRC_SEL, DST_SEL, SRC_BASE, DST_BASE, B_BASE, P_BASE. Each is masked to its port width, so a read gives back what conv_layer will see. ZP_* read back sign-extended |
 
 The cycle counter uses the same edge count as the conv_layer TB, so on the
@@ -250,7 +252,8 @@ bits [31:0].
 | B | 0x20_0000 | `addr` (B_ADDR_W bits) | 8N | write only (reads are SLVERR) |
 | P | 0x30_0000 | `addr` (P_ADDR_W bits) | 53 | write only |
 | DESC (2.0) | 0x40_0000 | descriptor word `i*16 + k` (`< DESC_DEPTH*16`) | 32 | write only, one slot, commits at once |
-| CYC (2.0) | 0x50_0000 | descriptor `i` (`< DESC_DEPTH`) | 32 | read only: edges the descriptor's layer took (engine start to done) in the last program that ran it |
+| CYC (2.0) | 0x50_0000 | descriptor `i` (`< DESC_DEPTH`); 2.1: `DESC_DEPTH + i` (`< 2*DESC_DEPTH`) | 32 | read only: edges the descriptor's layer took (engine start to done) in the last program that ran it; 2.1: in the second half, edges its weight fetch took (wdma start to done; 0 for weights already on chip) |
+| DDR (2.1) | 0x80_0000 | byte offset in the 8 MB page DDR_BASE selects | 32 | read and write, one 4-byte word per access, through wdma to the AXI4 memory. The response is DDR's (OKAY, SLVERR, DECERR). Refused while busy. DECERR when the build has no wdma |
 
     byte address = base + ((word_index << SLOT_SHIFT) + slot) * 4
 
@@ -300,6 +303,12 @@ host, the TBs and `run_network.py`. Host sequence for a network:
     W1C SEQ_STATUS done|err; SEQ_CTRL = start | first << 8
     poll SEQ_STATUS until done or err; read SEQ_ERR, then CYC[first .. first+layers-1]
     read back whichever layer outputs it wants
+
+2.1, weights in DDR: before the descriptors, write each DDR layer's B and P
+images through the DDR window (DDR_BASE per 8 MB page; `protocol.load_ddr`),
+then compare DDR_WCRC. A DDR layer's descriptor sets w_ddr, K and the two DDR
+addresses; its on-chip b_base/p_base are where wdma copies them. After the
+program, CYC[DESC_DEPTH + first ..] holds each layer's fetch time.
 
 **Starting a program exactly once.** The sticky bits are cleared before the
 start, so after a lost answer "busy, or done/err set" means the program
@@ -356,7 +365,7 @@ so the host batches instead. fpga/README.md records this.
 
 While `STATUS.busy = 1` (a legacy layer or, 2.0, a program running), the
 only accepted accesses are:
-* register reads (all of 0x00 .. 0x9C)
+* register reads (all of 0x00 .. 0xA4)
 * a write of `CTRL.soft_reset`
 * W1C writes to STATUS and (2.0) SEQ_STATUS
 
@@ -399,6 +408,16 @@ layer can already be done, and done is cleared by the next start.
   the bridge, the CSR's bus logic, the command registers, host_mode,
   LAUNCH_COUNT or the write CRCs. The bus is in the middle of answering the
   very write that asked for it, and the host needs LAUNCH_COUNT to survive.
+  2.1: a soft reset does not reset wdma (the MIG cannot be reset halfway
+  through an AXI burst). wdma takes it as an abort: no new burst, the one in
+  flight is accepted to RLAST and thrown away (dma/dma_contract.md, decision
+  4). Until that burst ends, SEQ_STATUS.busy and STATUS.busy stay 1, and the
+  CSR refuses what it refuses while a program runs: SLVERR for B, P, ACT,
+  DESC, DDR window and SEQ_CTRL.start. That is at most one burst of 256
+  beats plus the DDR latency, a few microseconds. At 1 Mbaud, the host's
+  next request after the soft reset will almost always find busy at 0
+  already. A host that polls SEQ_STATUS until busy is 0 is always safe.
+  top's TB holds the slave mid-burst to check it.
 * **UART RX** is the only asynchronous input besides the button. It goes
   through a 2-flop synchronizer (reset value 1 = idle) before the start-bit
   detector.

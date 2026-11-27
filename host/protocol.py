@@ -127,7 +127,8 @@ def parse_response(raw: Optional[bytes], read_words: int = 0) -> Tuple[int, List
 # ---------------------------------------------------------------------------
 
 ID_VALUE = 0x434E5631          # "CNV1"
-VERSION = 0x00020000           # 2.0: descriptor sequencer; 1.x maps still work for single layers
+VERSION = 0x00020100           # 2.1: weights from DDR (wdma); 2.0: descriptor sequencer;
+                               # 1.x maps still work for single layers
 SUPPORTED_MAJORS = (1, 2)
 
 A_ID, A_VERSION, A_PARAMS0, A_PARAMS1 = 0x00, 0x04, 0x08, 0x0C
@@ -154,11 +155,17 @@ A_PARAMS2 = 0x38               # [7:0] M_BITS, [15:8] DESC_DEPTH, [16] DMA prese
 A_SEQ_CTRL = 0x90              # write: [0] start, [15:8] start index
 A_SEQ_STATUS = 0x94            # [0] busy, [1] done (sticky), [2] err (sticky), [15:8] index,
                                # [31:16] layers done; W1C on [1] and [2]
-A_SEQ_ERR = 0x98               # [31:16] index of the failing descriptor, [10:0] its code
+A_SEQ_ERR = 0x98               # [31:16] index of the failing descriptor, [15:0] its code
 A_DESC_WCRC = 0x9C             # running CRC-16 over every descriptor word written
 DESC_BASE, CYC_BASE = 0x400000, 0x500000
 SEQ_START, SEQ_BUSY, SEQ_DONE, SEQ_ERR = 1, 1, 2, 4
 E_NOEND = 10
+# map 2.1: weights from DDR (dma/dma_contract.md). SEQ_ERR code bits 14:11 are
+# wdma's, bit 15 is a DDR layer in a build without wdma
+E_DMA_DIM, E_DMA_ALIGN, E_DMA_RANGE, E_DMA_RESP, E_NODMA = 11, 12, 13, 14, 15
+A_DDR_BASE = 0xA0              # RW: DDR byte address of the window's first byte, [31:23]
+A_DDR_WCRC = 0xA4              # running CRC-16 over every DDR window word written
+DDR_WIN, DDR_WIN_SIZE = 0x800000, 1 << 23
 OP_END, OP_CONV, OP_MAX2, OP_GAVG, OP_ADD = 0, 1, 2, 3, 4
 DESC_WORDS = 16
 # fields of the engine command bus, as layer_engine names them
@@ -181,6 +188,9 @@ def pack_descriptor(op: int, f: dict) -> List[int]:
     w[4] = (g("dst_base") & 0xFFFF) | (g("src2_base") & 0xFFFF) << 16
     w[5] = (g("b_base") & 0xFFFF) | (g("p_base") & 0xFF) << 16 | (g("add_shift") & 0xF) << 24
     w[6] = (g("add_ma") & 0xFFFF) | (g("add_mb") & 0xFFFF) << 16
+    w[7] = (g("w_ddr") & 1) | (g("k_words") & 0xFFFF) << 16     # 2.1: weight source
+    w[8] = g("b_src") & 0xFFFFFFFF
+    w[9] = g("p_src") & 0xFFFFFFFF
     return w
 
 
@@ -194,7 +204,8 @@ def unpack_descriptor(w: Sequence[int]):
              stride=w[2] >> 24 & 3, pad=w[2] >> 28 & 3, src_sel=w[3] & 0xF, dst_sel=w[3] >> 4 & 0xF,
              src2_sel=w[3] >> 8 & 0xF, src_base=w[3] >> 16, dst_base=w[4] & 0xFFFF,
              src2_base=w[4] >> 16, b_base=w[5] & 0xFFFF, p_base=w[5] >> 16 & 0xFF,
-             add_shift=w[5] >> 24 & 0xF, add_ma=w[6] & 0xFFFF, add_mb=w[6] >> 16)
+             add_shift=w[5] >> 24 & 0xF, add_ma=w[6] & 0xFFFF, add_mb=w[6] >> 16,
+             w_ddr=w[7] & 1, k_words=w[7] >> 16, b_src=w[8], p_src=w[9])
     return w[0] & 7, f
 
 
@@ -467,6 +478,8 @@ class ProgramResult:
     err_code: int               # 0 if the program reached END
     cycles: List[int]           # per finished descriptor, from the CYC window
     polls: int
+    fetch_cycles: List[int] = field(default_factory=list)   # 2.1: weight fetch per descriptor
+                                # (0 for a layer whose weights were already on chip)
 
 
 def start_program(first: int, stats):
@@ -488,9 +501,10 @@ def start_program(first: int, stats):
     raise LinkError("program start did not take")
 
 
-def run_program(first: int, stats, max_polls: int = 1_000_000):
+def run_program(first: int, stats, max_polls: int = 1_000_000, desc_depth: int = 0):
     """start, poll SEQ_STATUS until done or err, then read the first error and
-    the cycle count of every finished descriptor"""
+    the cycle count of every finished descriptor. with desc_depth (map 2.1),
+    also the weight-fetch counts, which sit DESC_DEPTH words further on"""
     yield from start_program(first, stats)
     for i in range(max_polls):
         st = yield from read32(A_SEQ_STATUS, stats)
@@ -501,10 +515,49 @@ def run_program(first: int, stats, max_polls: int = 1_000_000):
     yield from check_dropped(stats)
     err = yield from read32(A_SEQ_ERR, stats)
     layers = st >> 16
-    cycles = []
+    cycles, fetch = [], []
     if layers:
         cycles = yield from burst_read(CYC_BASE + 4 * first, layers, stats)
-    return ProgramResult(st, layers, err >> 16, err & 0x7FF if st & SEQ_ERR else 0, cycles, i + 1)
+        if desc_depth:
+            fetch = yield from burst_read(CYC_BASE + 4 * (desc_depth + first), layers, stats)
+    return ProgramResult(st, layers, err >> 16, err & 0xFFFF if st & SEQ_ERR else 0, cycles, i + 1,
+                         fetch)
+
+
+def ddr_words(images):
+    """[(DDR byte address, bytes)] -> [(DDR word address, [32-bit words])],
+    each image padded to whole words"""
+    out = []
+    for addr, data in images:
+        assert addr % 4 == 0, "DDR images start on a 4-byte boundary"
+        data = bytes(data) + bytes(-len(data) % 4)
+        out.append((addr, [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]))
+    return out
+
+
+def load_ddr(images, stats):
+    """map 2.1: write [(DDR byte address, bytes)] through the DDR window (8 MB
+    at a time, DDR_BASE picks which) and check DDR_WCRC; reload on mismatch"""
+    words = ddr_words(images)
+    for attempt in range(LOAD_TRIES):
+        yield from write32(A_CTRL, CTRL_CLEAR_WCRC, stats)
+        want = 0xFFFF
+        for addr, ws in words:
+            i = 0
+            while i < len(ws):
+                a = addr + 4 * i
+                page = a & ~(DDR_WIN_SIZE - 1)
+                yield from write32(A_DDR_BASE, page, stats)
+                n = min(len(ws) - i, (page + DDR_WIN_SIZE - a) // 4)
+                yield from burst_write(DDR_WIN + (a - page), ws[i:i + n], stats)
+                i += n
+            for w in ws:
+                want = crc16(w.to_bytes(4, "little"), want)
+        got = yield from read32(A_DDR_WCRC, stats)
+        if got == want:
+            return attempt + 1
+        stats.reloads += 1
+    raise RuntimeError(f"DDR write CRC {got:#06x}, host computed {want:#06x}")
 
 
 def check_dropped(stats):
@@ -754,11 +807,13 @@ if __name__ == "__main__":
                  dst_sel=rr.randint(0, 15), src2_sel=rr.randint(0, 15), src_base=rr.randint(0, 65535),
                  dst_base=rr.randint(0, 65535), src2_base=rr.randint(0, 65535),
                  b_base=rr.randint(0, 65535), p_base=rr.randint(0, 255), add_shift=rr.randint(0, 15),
-                 add_ma=rr.randint(0, 65535), add_mb=rr.randint(0, 65535))
+                 add_ma=rr.randint(0, 65535), add_mb=rr.randint(0, 65535),
+                 w_ddr=rr.randint(0, 1), k_words=rr.randint(0, 65535),
+                 b_src=rr.getrandbits(32), p_src=rr.getrandbits(32))
         op = rr.randint(0, 7)
         w = pack_descriptor(op, f)
         if (len(w), unpack_descriptor(w)) != (DESC_WORDS, (op, f)) or any(x >> 32 for x in w) \
-                or any(w[7:]):
+                or any(w[10:]):
             chk(f"descriptor round trip #{i}", unpack_descriptor(w), (op, f))
             break
     else:

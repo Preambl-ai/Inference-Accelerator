@@ -13,7 +13,7 @@ from protocol import (A_ACT_WCRC, A_B_WCRC, A_BUILD_ID, A_CMD0, A_CTRL, A_CYCLES
                       A_ID, A_LAUNCH, A_P_WCRC, A_PARAMS0, A_PARAMS1, A_SCRATCH, A_STATUS,
                       A_VERSION, ACT_BASE, B_BASE, CMD_FIELDS, ID_VALUE, P_BASE, P_WIDTH, VERSION,
                       A_PARAMS2, A_SEQ_CTRL, A_SEQ_STATUS, A_SEQ_ERR, A_DESC_WCRC, DESC_BASE,
-                      CYC_BASE, crc16, slot_shift, word_bytes)
+                      CYC_BASE, A_DDR_BASE, A_DDR_WCRC, DDR_WIN, crc16, slot_shift, word_bytes)
 
 OKAY, SLVERR, DECERR = 0, 2, 3
 
@@ -53,6 +53,12 @@ class CsrModel:
         self.seq_done = self.seq_err = 0
         self.desc_crc = 0xFFFF
         self.seq_starts = []            # start index of every program start, in order
+        # map 2.1: the DDR window (HAS_DMA); `ddr` is set by the TB: a
+        # callable (we, byte address, data) -> (resp, read data)
+        self.ddr_page = 0
+        self.ddr_crc = 0xFFFF
+        self.ddr = None
+        self.ddr_log = []               # (we, address, data) of every access sent to DDR
 
     # -- helpers -------------------------------------------------------------
     def params0(self):
@@ -68,6 +74,8 @@ class CsrModel:
         if addr >> 8 == 0:
             return "reg", None, None
         top = addr >> 20
+        if addr >> 23:                      # 2.1: the 8 MB DDR window
+            return ("ddr", 0, 0) if self.has_dma else (None, None, None)
         if top in (4, 5):                   # 2.0: descriptor words / cycle counts, one slot
             return ("desc" if top == 4 else "cyc"), (addr & 0xFFFFF) >> 2, 0
         name = {1: "act", 2: "b", 3: "p"}.get(top)
@@ -82,7 +90,9 @@ class CsrModel:
         if name == "desc":
             return idx < self.desc_depth * 16
         if name == "cyc":
-            return idx < self.desc_depth
+            return idx < 2 * self.desc_depth     # 2.1: second half = weight-fetch cycles
+        if name == "ddr":
+            return True
         if name == "act":
             return idx >> (self.sel_w + self.aw) == 0 and (idx >> self.aw) < self.nbuf
         return idx >> (self.b_aw if name == "b" else self.p_aw) == 0
@@ -102,6 +112,8 @@ class CsrModel:
                               | (self.seq_err << 2) | (self.seq_done << 1) | self.seq["busy"],
                 A_SEQ_ERR: (self.seq["err_index"] << 16) | self.seq["err_code"],
                 A_DESC_WCRC: self.desc_crc}
+        if self.has_dma:
+            vals.update({A_DDR_BASE: self.ddr_page << 23, A_DDR_WCRC: self.ddr_crc})
         if off in vals:
             return vals[off]
         if A_CMD0 <= off < A_CMD0 + 4 * len(CMD_FIELDS) and off % 4 == 0:
@@ -136,6 +148,11 @@ class CsrModel:
                 if data & 8:
                     self.wcrc = {k: 0xFFFF for k in self.wcrc}
                     self.desc_crc = 0xFFFF
+                    self.ddr_crc = 0xFFFF
+                return OKAY
+            if off == A_DDR_BASE and self.has_dma:
+                if busy: return SLVERR
+                self.ddr_page = (data >> 23) & 0x1FF
                 return OKAY
             if off == A_SEQ_CTRL:
                 if busy: return SLVERR
@@ -167,6 +184,15 @@ class CsrModel:
             return DECERR
         if name == "cyc":
             return SLVERR                   # read only
+        if name == "ddr":
+            if busy:
+                return SLVERR
+            a = (self.ddr_page << 23) | (addr & 0x7FFFFC)
+            self.ddr_log.append((1, a, data))
+            resp, _ = self.ddr(1, a, data)
+            if resp == OKAY:
+                self.ddr_crc = crc16(data.to_bytes(4, "little"), self.ddr_crc)
+            return resp
         if busy or (name == "act" and not self.host_mode):
             return SLVERR
         if name == "desc":
@@ -211,6 +237,12 @@ class CsrModel:
             return SLVERR, 0                # write only
         if name == "cyc":
             return (SLVERR, 0) if busy else (OKAY, cyc(idx))
+        if name == "ddr":
+            if busy:
+                return SLVERR, 0
+            a = (self.ddr_page << 23) | (addr & 0x7FFFFC)
+            self.ddr_log.append((0, a, 0))
+            return self.ddr(0, a, 0)
         if busy or self.host_mode:
             return SLVERR, 0
         word = mem(idx >> self.aw, idx & ((1 << self.aw) - 1))
@@ -308,7 +340,7 @@ if __name__ == "__main__":
 
     # map 2.0
     m = CsrModel(n=4, nbuf=3, desc_depth=32, m_bits=8)
-    chk("VERSION is 2.0", m.read(A_VERSION)[1], 0x00020000)
+    chk("VERSION major is 2", m.read(A_VERSION)[1] >> 16, 2)
     chk("PARAMS2", m.read(A_PARAMS2)[1], (32 << 8) | 8)
     chk("descriptor word written", (m.write(DESC_BASE + 4 * 17, 0xDEADBEEF), m.commits[-1]),
         (OKAY, ("desc", 17, 0xDEADBEEF)))
@@ -327,6 +359,33 @@ if __name__ == "__main__":
     m.seq_finished()
     m.write(A_CTRL, 2)
     chk("soft reset clears the program's sticky bits", m.read(A_SEQ_STATUS)[1] & 6, 0)
+
+    # map 2.1: the DDR window, without and with wdma
+    m = CsrModel(n=4, nbuf=3, desc_depth=32)
+    chk("2.1 VERSION", m.read(A_VERSION)[1], 0x00020100)
+    chk("no wdma: DDR window unmapped", (m.write(DDR_WIN, 1), m.read(DDR_WIN)), (DECERR, (DECERR, 0)))
+    chk("no wdma: DDR_BASE unmapped", (m.write(A_DDR_BASE, 1 << 23), m.read(A_DDR_BASE)), (DECERR, (DECERR, 0)))
+    chk("CYC fetch half mapped", m.read(CYC_BASE + 4 * 63, cyc=lambda i: i), (OKAY, 63))
+    chk("CYC past the fetch half unmapped", m.read(CYC_BASE + 4 * 64, cyc=lambda i: i), (DECERR, 0))
+    m = CsrModel(n=4, nbuf=3, desc_depth=32, has_dma=1)
+    store = {}
+    m.ddr = lambda we, a, d: (store.__setitem__(a, d), (OKAY, 0))[1] if we else (OKAY, store.get(a, 0))
+    chk("PARAMS2 says wdma", m.read(A_PARAMS2)[1] >> 16, 1)
+    m.write(A_DDR_BASE, 0x1234_5678)
+    chk("DDR_BASE keeps [31:23]", m.read(A_DDR_BASE)[1], 0x1234_5678 & ~0x7FFFFF)
+    m.write(A_DDR_BASE, 3 << 23)
+    chk("DDR write lands at page | offset", (m.write(DDR_WIN + 0x10, 0xCAFE), store), (OKAY, {(3 << 23) | 0x10: 0xCAFE}))
+    chk("DDR read back", m.read(DDR_WIN + 0x10), (OKAY, 0xCAFE))
+    chk("DDR_WCRC over the word", m.read(A_DDR_WCRC)[1], crc16((0xCAFE).to_bytes(4, "little")))
+    chk("busy: DDR access and DDR_BASE refused",
+        (m.write(DDR_WIN, 1, busy=True), m.read(DDR_WIN, busy=True), m.write(A_DDR_BASE, 0, busy=True)),
+        (SLVERR, (SLVERR, 0), SLVERR))
+    m.ddr = lambda we, a, d: (SLVERR, 0)
+    crc = m.read(A_DDR_WCRC)[1]
+    chk("DDR's SLVERR passes through and leaves DDR_WCRC", (m.write(DDR_WIN, 5), m.read(A_DDR_WCRC)[1]),
+        (SLVERR, crc))
+    m.write(A_CTRL, 8)
+    chk("clear_wcrc clears DDR_WCRC", m.read(A_DDR_WCRC)[1], 0xFFFF)
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)

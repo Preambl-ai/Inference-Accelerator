@@ -56,7 +56,11 @@ the sequencer runs, it owns the bus and the CSR refuses CTRL.start.
 | 5 | [23:16] | p_base |
 | 5 | [27:24] | add_shift |
 | 6 | [15:0], [31:16] | add_ma, add_mb |
-| 7-15 | | reserved, 0 (phase 4: weight source and DDR addresses) |
+| 7 | [0] | w_ddr (phase 4): this CONV's B and P come from DDR through wdma before it runs. Ignored for other ops |
+| 7 | [31:16] | k_words: K, the B words per output group (kh*kw*cin_words*N; the host computes it, so the sequencer needs no multiplier) |
+| 8 | [31:0] | b_src: DDR byte address of output group 0's B (8-byte aligned) |
+| 9 | [31:0] | p_src: DDR byte address of output channel 0's P entry (8-byte aligned) |
+| 10-15 | | reserved, 0 |
 
 Each field is truncated to layer_engine's port width (ADDR_WIDTH, SEL_WIDTH,
 B_ADDR_W, P_ADDR_W, M_BITS), exactly as the CSR command registers are.
@@ -83,14 +87,31 @@ at their usual widths (16/32/64) do not. Those are what phase 4's DMA is for:
 B and P come from DDR per output group, and the on-chip B/P become a cache
 of one layer.
 
+### 5. DESC_DEPTH on the board (phase 4)
+
+ResNet-20 is 32 layers once each residual block is split into its convs and
+its add (the downsampling blocks add a 1x1 skip conv). With END that is 33
+descriptors, one more than the 32 of phase 3.
+
+| | keep 32, run ResNet-20 as two programs | **64 (chosen)** |
+| --- | --- | --- |
+| cost | none in RTL | descriptor RAM 1024 x 32 b = one BRAM36 (was one BRAM18): +0.5 BRAM36; cycle RAM 128 x 32 b, still LUTRAM |
+| host work | the host starts the second half: a per-network step, against the goal | none |
+| ceiling | - | PARAMS2 reports DESC_DEPTH in 8 bits: 128 without a map change |
+
+**Chosen: DESC_DEPTH = 64 in top.** The sequencer itself is unchanged
+(IDX_W follows the parameter), and the CSR's DESC and CYC windows size from
+it. A host reads DESC_DEPTH from PARAMS2 and does not assume 32.
+
 ## Ports
 
 | group | ports |
 | ----- | ----- |
 | control | `start`, `start_index[IDX_W-1:0]`, `busy`, `done` (pulse), `err` (pulse) |
-| status | `cur_index`, `layers_done` (count of descriptors finished), `err_index`, `err_code[10:0]` (bits 0-9 from layer_engine, bit 10 = E_NOEND) |
+| status | `cur_index`, `layers_done` (count of descriptors finished), `err_index`, `err_code[15:0]`: [9:0] from layer_engine, [10] E_NOEND, [14:11] wdma's E_DIM/E_ALIGN/E_RANGE/E_RESP, [15] E_NODMA (w_ddr set in a build without wdma) |
 | descriptor RAM | write port from the CSR: `desc_we`, `desc_waddr[IDX_W+3:0]`, `desc_wdata[31:0]` |
-| cycle RAM | read port to the CSR: `cyc_rd_en`, `cyc_rd_addr[IDX_W-1:0]`, `cyc_rd_data[31:0]` (READ_LATENCY like any bram) |
+| cycle RAM | read port to the CSR: `cyc_rd_en`, `cyc_rd_addr[IDX_W:0]`, `cyc_rd_data[31:0]` (READ_LATENCY like any bram). Entries [0, DESC_DEPTH) are layer cycles, [DESC_DEPTH, 2*DESC_DEPTH) the weight-fetch cycles of the same descriptor |
+| wdma (phase 4) | `dma_start`, `dma_b_src`, `dma_p_src`, `dma_k` out (groups = cout_words, destinations = b_base and p_base, from the bus); `dma_ready`, `dma_done`, `dma_err`, `dma_err_code[3:0]` in. Unused when HAS_DMA = 0 |
 | engine | the layer_engine command bus (`eng_start`, `eng_op` and every field), and the engine's `ready`, `done`, `err`, `err_code` |
 
 `IDX_W = log2(DESC_DEPTH)`; the default DESC_DEPTH is 32.
@@ -101,6 +122,11 @@ of one layer.
     loop:
       FETCH   read words idx*16 .. idx*16+15 into the descriptor register
       if op == END: done, stop
+      DMA     (CONV with w_ddr only) start wdma: B from b_src -> B[b_base ..], P from p_src ->
+              P[p_base ..], one output group at a time; count edges from the accepting edge to
+              its done -> cycle RAM[DESC_DEPTH + idx]
+              wdma err -> err_index = idx, err_code[14:11] = its code, stop
+              (HAS_DMA = 0: err with E_NODMA instead)
       LAUNCH  drive the fields, pulse eng_start (the engine is ready by construction)
       RUN     count edges from the accepting edge to the engine's done or err
               done -> cycle RAM[idx] = count, layers_done += 1
@@ -112,6 +138,11 @@ of one layer.
   edge to done. For each layer it therefore equals the engine formula (conv,
   pool or add).
 * A descriptor's cycle-RAM word is written only when it finishes with done.
+  Its fetch word (second half) is written when the fetch finishes, so a
+  layer that fails after a good fetch still shows the fetch time.
+* A descriptor without w_ddr runs exactly as in phase 3: same states, same
+  overhead. With w_ddr, the on-chip B and P are a one-layer cache, so every
+  DDR layer of a program can use b_base = p_base = 0.
 
 ## Illegal use
 

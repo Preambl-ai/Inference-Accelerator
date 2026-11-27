@@ -5,6 +5,13 @@
 // whole program of layers loaded through the CSR's descriptor window.
 // contract: top/host_interface_contract.md.
 //
+// weights from DDR (phase 4, HAS_DMA = 1): wdma fetches a layer's B and P
+// from DDR3 over AXI4 into the on-chip memories before the layer runs; the
+// sequencer starts it for descriptors with w_ddr set. ddr_port is where the
+// MIG goes (dma/rtl/ddr_port.sv, fpga/README.md); in simulation the cocotb
+// AXI4 slave model drives it. HAS_DMA = 0 builds the phase-3 board: no wdma,
+// no DDR window, and a DDR descriptor fails with E_NODMA.
+//
 // one clock domain. CLK_DIV = 1 runs everything on the 100 MHz board clock;
 // CLK_DIV = 2 puts an MMCME2_BASE in front for 50 MHz (synthesis only, for
 // when timing does not close). CLKS_PER_BIT follows the clock, so at 1 Mbaud
@@ -42,7 +49,12 @@ module top #(
     // descriptor's p_base field is 8 bits, so this is also the ceiling.
     parameter int P_ADDR_W     = 8,
     parameter int M_BITS       = 8,                    // add rescale multiplier width
-    parameter int DESC_DEPTH   = 32,                   // descriptors (one BRAM18)
+    // 64 descriptors (16 words each = one BRAM36): ResNet-20 is 33 layers
+    // plus END. PARAMS2 reports it in 8 bits, so 128 is the ceiling.
+    parameter int DESC_DEPTH   = 64,
+    // wdma and the DDR port. 0 until the MIG is generated: ddr_port stops a
+    // HAS_DMA = 1 synthesis on purpose (fpga/README.md, "DDR3 through the MIG")
+    parameter int HAS_DMA      = 0,
     parameter int HB_BIT       = 26,                   // heartbeat ~0.75 Hz at 100 MHz
     parameter int RST_HOLD     = 16
 )(
@@ -58,6 +70,8 @@ module top #(
     localparam int SEL_WIDTH = (NBUF > 1) ? $clog2(NBUF) : 1;
     localparam int AXI_ADDR_W = 24;
     localparam int IDX_W = (DESC_DEPTH > 1) ? $clog2(DESC_DEPTH) : 1;
+    localparam int DDR_AW  = 32;                       // wdma's AXI4 address
+    localparam int DDR_IDW = 4;
 
     // ------------------------------------------------------------------
     // clock
@@ -193,11 +207,26 @@ module top #(
     logic seq_start, seq_busy, seq_done, seq_err;
     logic [IDX_W-1:0] seq_start_index, seq_cur_index, seq_err_index;
     logic [IDX_W:0] seq_layers_done;
-    logic [10:0] seq_err_code;
+    logic [15:0] seq_err_code;
     logic desc_we, cyc_rd_en;
     logic [IDX_W+3:0] desc_waddr;
     logic [31:0] desc_wdata, cyc_rd_data;
-    logic [IDX_W-1:0] cyc_rd_addr;
+    logic [IDX_W:0] cyc_rd_addr;
+
+    // wdma: its fetch command from the sequencer, its host port from the CSR
+    logic dma_start, dma_ready, dma_busy, dma_done, dma_err;
+    logic [3:0] dma_err_code;
+    logic [DDR_AW-1:0] dma_b_src, dma_p_src;
+    logic [K_WIDTH-1:0] dma_k;
+    logic ddr_req, ddr_we, ddr_ack;
+    logic [31:0] ddr_addr, ddr_wdata, ddr_rdata;
+    logic [1:0] ddr_resp;
+    // B and P writes: the CSR's (host loads) and wdma's (fetches)
+    logic csr_b_we, csr_p_we, dma_b_we, dma_p_we;
+    logic [B_ADDR_W-1:0] csr_b_waddr, dma_b_waddr;
+    logic [N*8-1:0] csr_b_wdata, dma_b_wdata;
+    logic [P_ADDR_W-1:0] csr_p_waddr, dma_p_waddr;
+    logic [52:0] csr_p_wdata, dma_p_wdata;
 
     logic seq_eng_start;
     logic [2:0] seq_op;
@@ -218,7 +247,7 @@ module top #(
         .N(N), .ADDR_WIDTH(ADDR_WIDTH), .READ_LATENCY(READ_LATENCY), .NBUF(NBUF),
         .B_ADDR_W(B_ADDR_W), .P_ADDR_W(P_ADDR_W), .K_MAX(K_MAX), .DIM_W(DIM_W),
         .CW_W(CW_W), .BUILD_ID(BUILD_ID), .AXI_ADDR_W(AXI_ADDR_W), .M_BITS(M_BITS),
-        .DESC_DEPTH(DESC_DEPTH), .HAS_DMA(0)
+        .DESC_DEPTH(DESC_DEPTH), .HAS_DMA(HAS_DMA)
     ) u_csr (
         .clk(clk), .reset(sys_reset),
         .s_awaddr(awaddr), .s_awvalid(awvalid), .s_awready(awready),
@@ -240,22 +269,28 @@ module top #(
         .host_wdata(host_wdata), .host_wr_sel(host_wr_sel),
         .host_rd_en(host_rd_en), .host_rd_addr(host_rd_addr), .host_rd_sel(host_rd_sel),
         .host_rd_data(host_rd_data),
-        .b_we(b_we), .b_waddr(b_waddr), .b_wdata(b_wdata),
-        .p_we(p_we), .p_waddr(p_waddr), .p_wdata(p_wdata),
+        .b_we(csr_b_we), .b_waddr(csr_b_waddr), .b_wdata(csr_b_wdata),
+        .p_we(csr_p_we), .p_waddr(csr_p_waddr), .p_wdata(csr_p_wdata),
         .done_sticky(done_sticky), .err_sticky(err_sticky),
-        .seq_start(seq_start), .seq_start_index(seq_start_index), .seq_busy(seq_busy),
+        // a fetch that a soft reset cut short is still draining its burst
+        // (dma_contract.md decision 4): the CSR counts it as a busy program,
+        // so no host write to B or P can land under wdma's last writes
+        .seq_start(seq_start), .seq_start_index(seq_start_index),
+        .seq_busy(seq_busy || dma_busy),
         .seq_done(seq_done), .seq_err(seq_err), .seq_cur_index(seq_cur_index),
         .seq_layers_done(seq_layers_done), .seq_err_index(seq_err_index),
         .seq_err_code(seq_err_code),
         .desc_we(desc_we), .desc_waddr(desc_waddr), .desc_wdata(desc_wdata),
-        .cyc_rd_en(cyc_rd_en), .cyc_rd_addr(cyc_rd_addr), .cyc_rd_data(cyc_rd_data)
+        .cyc_rd_en(cyc_rd_en), .cyc_rd_addr(cyc_rd_addr), .cyc_rd_data(cyc_rd_data),
+        .ddr_req(ddr_req), .ddr_we(ddr_we), .ddr_addr(ddr_addr), .ddr_wdata(ddr_wdata),
+        .ddr_ack(ddr_ack), .ddr_resp(ddr_resp), .ddr_rdata(ddr_rdata)
     );
 
     // the sequencer: soft reset stops a program, like it stops a layer
     sequencer #(
         .ADDR_WIDTH(ADDR_WIDTH), .NBUF(NBUF), .B_ADDR_W(B_ADDR_W), .P_ADDR_W(P_ADDR_W),
         .DIM_W(DIM_W), .CW_W(CW_W), .M_BITS(M_BITS), .DESC_DEPTH(DESC_DEPTH),
-        .READ_LATENCY(READ_LATENCY)
+        .READ_LATENCY(READ_LATENCY), .HAS_DMA(HAS_DMA), .K_WIDTH(K_WIDTH), .AXI_AW(DDR_AW)
     ) u_seq (
         .clk(clk), .reset(sys_reset || soft_reset),
         .start(seq_start), .start_index(seq_start_index), .busy(seq_busy),
@@ -263,6 +298,9 @@ module top #(
         .layers_done(seq_layers_done), .err_index(seq_err_index), .err_code(seq_err_code),
         .desc_we(desc_we), .desc_waddr(desc_waddr), .desc_wdata(desc_wdata),
         .cyc_rd_en(cyc_rd_en), .cyc_rd_addr(cyc_rd_addr), .cyc_rd_data(cyc_rd_data),
+        .dma_start(dma_start), .dma_b_src(dma_b_src), .dma_p_src(dma_p_src), .dma_k(dma_k),
+        .dma_ready(dma_ready), .dma_done(dma_done), .dma_err(dma_err),
+        .dma_err_code(dma_err_code),
         .eng_start(seq_eng_start), .eng_op(seq_op), .h_in(seq_h_in), .w_in(seq_w_in),
         .h_out(seq_h_out), .w_out(seq_w_out), .cin_words(seq_cin_words),
         .cout_words(seq_cout_words), .kh(seq_kh), .kw(seq_kw), .stride(seq_stride),
@@ -274,6 +312,81 @@ module top #(
         .eng_ready(eng_ready), .eng_done(eng_done), .eng_err(eng_err),
         .eng_err_code(eng_err_code)
     );
+
+    // wdma and the DDR port. wdma's reset is the board reset only: the MIG
+    // does not see the soft reset, so wdma gets it as `abort` and finishes the
+    // AXI burst in flight (dma_contract.md decision 4). the fetch's group
+    // count and on-chip destinations are the descriptor's own cout_words,
+    // b_base and p_base, which the sequencer holds while it waits for wdma.
+    generate
+        if (HAS_DMA != 0) begin : g_dma
+            logic [DDR_AW-1:0] araddr_d, awaddr_d;
+            logic [7:0]  arlen_d, awlen_d;
+            logic [2:0]  arsize_d, awsize_d;
+            logic [1:0]  arburst_d, awburst_d, rresp_d, bresp_d;
+            logic [DDR_IDW-1:0] arid_d, rid_d, awid_d, bid_d;
+            logic arvalid_d, arready_d, rlast_d, rvalid_d, rready_d;
+            logic awvalid_d, awready_d, wlast_d, wvalid_d, wready_d, bvalid_d, bready_d;
+            logic [63:0] rdata_d, wdata_d;
+            logic [7:0]  wstrb_d;
+
+            wdma #(
+                .N(N), .B_ADDR_W(B_ADDR_W), .P_ADDR_W(P_ADDR_W), .K_WIDTH(K_WIDTH),
+                .CW_W(CW_W), .AXI_AW(DDR_AW), .AXI_IDW(DDR_IDW)
+            ) u_dma (
+                .clk(clk), .reset(sys_reset), .abort(soft_reset),
+                .f_start(dma_start), .f_b_src(dma_b_src), .f_p_src(dma_p_src), .f_k(dma_k),
+                .f_groups(seq_cout_words), .f_b_dst(seq_b_base), .f_p_dst(seq_p_base),
+                .f_ready(dma_ready), .busy(dma_busy), .f_done(dma_done), .f_err(dma_err),
+                .f_err_code(dma_err_code),
+                .h_req(ddr_req), .h_we(ddr_we), .h_addr(ddr_addr), .h_wdata(ddr_wdata),
+                .h_ack(ddr_ack), .h_resp(ddr_resp), .h_rdata(ddr_rdata),
+                .b_we(dma_b_we), .b_waddr(dma_b_waddr), .b_wdata(dma_b_wdata),
+                .p_we(dma_p_we), .p_waddr(dma_p_waddr), .p_wdata(dma_p_wdata),
+                .araddr(araddr_d), .arlen(arlen_d), .arsize(arsize_d), .arburst(arburst_d),
+                .arid(arid_d), .arvalid(arvalid_d), .arready(arready_d), .rdata(rdata_d),
+                .rresp(rresp_d), .rlast(rlast_d), .rid(rid_d), .rvalid(rvalid_d),
+                .rready(rready_d),
+                .awaddr(awaddr_d), .awlen(awlen_d), .awsize(awsize_d), .awburst(awburst_d),
+                .awid(awid_d), .awvalid(awvalid_d), .awready(awready_d), .wdata(wdata_d),
+                .wstrb(wstrb_d), .wlast(wlast_d), .wvalid(wvalid_d), .wready(wready_d),
+                .bresp(bresp_d), .bid(bid_d), .bvalid(bvalid_d), .bready(bready_d)
+            );
+
+            ddr_port #(.AXI_IDW(DDR_IDW)) u_ddr (
+                .clk(clk), .reset(sys_reset),
+                .araddr(araddr_d), .arlen(arlen_d), .arsize(arsize_d), .arburst(arburst_d),
+                .arid(arid_d), .arvalid(arvalid_d), .arready(arready_d), .rdata(rdata_d),
+                .rresp(rresp_d), .rlast(rlast_d), .rid(rid_d), .rvalid(rvalid_d),
+                .rready(rready_d),
+                .awaddr(awaddr_d), .awlen(awlen_d), .awsize(awsize_d), .awburst(awburst_d),
+                .awid(awid_d), .awvalid(awvalid_d), .awready(awready_d), .wdata(wdata_d),
+                .wstrb(wstrb_d), .wlast(wlast_d), .wvalid(wvalid_d), .wready(wready_d),
+                .bresp(bresp_d), .bid(bid_d), .bvalid(bvalid_d), .bready(bready_d)
+            );
+        end else begin : g_no_dma
+            assign {dma_ready, dma_busy, dma_done, dma_err, dma_err_code} = '0;
+            assign {ddr_ack, ddr_resp, ddr_rdata} = '0;
+            assign {dma_b_we, dma_b_waddr, dma_b_wdata} = '0;
+            assign {dma_p_we, dma_p_waddr, dma_p_wdata} = '0;
+        end
+    endgenerate
+
+    // the on-chip B and P write ports belong to wdma while it is busy (its
+    // last registered write included) and to the CSR otherwise; the CSR
+    // refuses B and P writes while busy, so the two never write together
+    assign b_we    = dma_busy ? dma_b_we    : csr_b_we;
+    assign b_waddr = dma_busy ? dma_b_waddr : csr_b_waddr;
+    assign b_wdata = dma_busy ? dma_b_wdata : csr_b_wdata;
+    assign p_we    = dma_busy ? dma_p_we    : csr_p_we;
+    assign p_waddr = dma_busy ? dma_p_waddr : csr_p_waddr;
+    assign p_wdata = dma_busy ? dma_p_wdata : csr_p_wdata;
+
+`ifndef SYNTHESIS
+    always @(posedge clk)
+        if (!sys_reset && dma_busy && (csr_b_we || csr_p_we))
+            $fatal(1, "top: host B/P write while wdma is busy (the CSR must refuse it)");
+`endif
 
     // layer_engine: conv, pool and add on one act_buffer. the command bus
     // belongs to the sequencer while a program runs, otherwise to the CSR's
@@ -352,8 +465,9 @@ module top #(
         if (sys_reset) hb_cnt <= '0;
         else           hb_cnt <= hb_cnt + 1'b1;
 
-    // LD5 shows a program or a legacy layer running; LD6/LD7 are the legacy
-    // command's sticky bits (a program reports through SEQ_STATUS)
-    assign led = {err_sticky, done_sticky, eng_busy || seq_busy, hb_cnt[HB_BIT]};
+    // LD5 shows a program (its fetches included) or a legacy layer running;
+    // LD6/LD7 are the legacy command's sticky bits (a program reports
+    // through SEQ_STATUS)
+    assign led = {err_sticky, done_sticky, eng_busy || seq_busy || dma_busy, hb_cnt[HB_BIT]};
 
 endmodule

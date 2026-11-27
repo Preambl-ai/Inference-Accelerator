@@ -56,10 +56,11 @@ jobs:
           PYTHONPATH=conv_layer/model:systolic_array/model python pool/model/pool_model.py
           PYTHONPATH=conv_layer/model:systolic_array/model:pool/model:add/model python layer_engine/model/layer_engine_model.py
           PYTHONPATH=conv_layer/model:systolic_array/model python add/model/add_model.py
-          PYTHONPATH=conv_layer/model:systolic_array/model:pool/model:add/model:layer_engine/model python sequencer/model/sequencer_model.py
-          PYTHONPATH=host:conv_layer/model:systolic_array/model:memory/model:pool/model:add/model:layer_engine/model:sequencer/model python host/network.py
+          PYTHONPATH=conv_layer/model:systolic_array/model:pool/model:add/model:layer_engine/model:dma/model python sequencer/model/sequencer_model.py
+          PYTHONPATH=host:conv_layer/model:systolic_array/model:memory/model:pool/model:add/model:layer_engine/model:sequencer/model:dma/model python host/network.py
           python host/run_network.py --dry-run --plan lenet --h 32 --w 32 --c 3
           python host/run_layer.py --dry-run
+          python dma/model/dma_model.py
 
       - name: systolic array sweep
         run: make sweep-array
@@ -111,6 +112,9 @@ jobs:
 
       - name: whole networks through the UART pins (N=8)
         run: make sweep-net
+
+      - name: weight DMA sweep (AXI4 slave model)
+        run: make sweep-dma
 
       - name: Upload results
         if: always()

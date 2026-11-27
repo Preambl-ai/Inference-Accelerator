@@ -30,10 +30,18 @@ CONV_NBUF ?= 2
 # the residual add reads two banks and writes a third
 ADD_NBUF ?= 3
 DESC_DEPTH ?= 32
+SEQ_HAS_DMA ?= 0
+CSR_HAS_DMA ?= 0
+# top with wdma and the DDR port (the TB's AXI4 slave plays the MIG)
+TOP_HAS_DMA ?= 0
+SEQ_WEIGHTS ?=
+export SEQ_WEIGHTS
 LAYERS ?=
 export LAYERS
 SEED ?=
 export SEED
+NET_PLAN ?=
+export NET_PLAN
 export K
 export N
 export ALLOW_K0
@@ -165,7 +173,8 @@ COMPILE_ARGS += -Pcsr.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pcsr.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Pcsr.NBUF=$(NBUF)
 COMPILE_ARGS += -Pcsr.DESC_DEPTH=$(DESC_DEPTH)
-SIM_BUILD = sim_build/csr_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)_dd_$(DESC_DEPTH)
+COMPILE_ARGS += -Pcsr.HAS_DMA=$(CSR_HAS_DMA)
+SIM_BUILD = sim_build/csr_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(NBUF)_dd_$(DESC_DEPTH)_dma_$(CSR_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),top)
@@ -173,6 +182,7 @@ VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/
 VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/layer_engine/rtl/layer_engine.sv
 VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(PWD)/add/rtl/add_layer.sv $(CONV_SRCS)
 VERILOG_SOURCES += $(PWD)/sequencer/rtl/sequencer.sv
+VERILOG_SOURCES += $(PWD)/dma/rtl/wdma.sv $(PWD)/dma/rtl/ddr_port.sv
 COMPILE_ARGS += -Ptop.N=$(N)
 COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
@@ -180,7 +190,8 @@ COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Ptop.CLKS_PER_BIT=$(CLKS_PER_BIT)
 COMPILE_ARGS += -Ptop.TIMEOUT_BITS=$(TIMEOUT_BITS)
 COMPILE_ARGS += -Ptop.HB_BIT=6
-SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)
+COMPILE_ARGS += -Ptop.HAS_DMA=$(TOP_HAS_DMA)
+SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)_dma_$(TOP_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),pool_harness)
@@ -213,6 +224,17 @@ COMPILE_ARGS += -Padd_harness.NBUF=$(ADD_NBUF)
 SIM_BUILD = sim_build/add_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)
 endif
 
+# weight DMA against the Python AXI4 slave (latency and backpressure from the env)
+AXI_LAT ?= 3
+AXI_STALL ?= 0
+export AXI_LAT
+export AXI_STALL
+ifeq ($(MODULE_NAME),wdma)
+COMPILE_ARGS += -Pwdma.N=$(N)
+COMPILE_ARGS += -Pwdma.B_ADDR_W=$(B_ADDR_W)
+SIM_BUILD = sim_build/wdma_n_$(N)_baw_$(B_ADDR_W)
+endif
+
 ifeq ($(MODULE_NAME),seq_harness)
 VERILOG_SOURCES += $(PWD)/sequencer/tb/seq_harness.sv $(PWD)/sequencer/rtl/sequencer.sv
 VERILOG_SOURCES += $(PWD)/layer_engine/rtl/layer_engine.sv $(PWD)/pool/rtl/pool_layer.sv
@@ -222,7 +244,9 @@ COMPILE_ARGS += -Pseq_harness.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Pseq_harness.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Pseq_harness.NBUF=$(ADD_NBUF)
 COMPILE_ARGS += -Pseq_harness.DESC_DEPTH=$(DESC_DEPTH)
-SIM_BUILD = sim_build/seq_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)_dd_$(DESC_DEPTH)
+COMPILE_ARGS += -Pseq_harness.HAS_DMA=$(SEQ_HAS_DMA)
+VERILOG_SOURCES += $(PWD)/dma/rtl/wdma.sv
+SIM_BUILD = sim_build/seq_n_$(N)_aw_$(ADDR_WIDTH)_rl_$(READ_LATENCY)_nb_$(ADD_NBUF)_dd_$(DESC_DEPTH)_dma_$(SEQ_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),act_buffer)
@@ -241,7 +265,7 @@ endif
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net check-flow sweep-all
+.PHONY: sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net sweep-dma check-flow sweep-all
 
 sweep:
 	@for d in 0 1 2 4 8; do \
@@ -410,6 +434,12 @@ sweep-csr:
 	    done; \
 	  done; \
 	done
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== csr + DDR window N=$$n READ_LATENCY=$$rl ==="; \
+	    $(MAKE) -s MODULE_NAME=csr N=$$n READ_LATENCY=$$rl NBUF=3 ADDR_WIDTH=6 CSR_HAS_DMA=1 || exit 1; \
+	  done; \
+	done
 	@echo "=== csr DESC_DEPTH=4 (index wrap, small windows) ==="
 	@$(MAKE) -s MODULE_NAME=csr N=4 READ_LATENCY=2 NBUF=3 ADDR_WIDTH=6 DESC_DEPTH=4 || exit 1
 	@echo "=== csr sweep passed ==="
@@ -420,6 +450,12 @@ sweep-top:
 	  set -- $$cfg; \
 	  echo "=== top N=$$1 READ_LATENCY=$$2 CLKS_PER_BIT=8 ==="; \
 	  $(MAKE) -s MODULE_NAME=top N=$$1 READ_LATENCY=$$2 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 || exit 1; \
+	done
+	@for cfg in "2 1 3 0" "4 2 9 0.3"; do \
+	  set -- $$cfg; \
+	  echo "=== top + wdma N=$$1 READ_LATENCY=$$2 AXI_LAT=$$3 AXI_STALL=$$4 ==="; \
+	  $(MAKE) -s MODULE_NAME=top N=$$1 READ_LATENCY=$$2 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
+	    TOP_HAS_DMA=1 AXI_LAT=$$3 AXI_STALL=$$4 || exit 1; \
 	done
 	@echo "=== top sweep passed ==="
 
@@ -462,6 +498,21 @@ sweep-add:
 	@$(MAKE) -s MODULE_NAME=add_harness N=4 READ_LATENCY=2 ADDR_WIDTH=9 ADD_NBUF=2 || exit 1
 	@echo "=== add sweep passed ==="
 
+# weight DMA: N against AXI latency and backpressure (wdma has no
+# READ_LATENCY; its timing comes from the slave). 0.3 stalls every channel
+# 30 % of cycles; latency 1 is the fastest a slave can answer
+sweep-dma:
+	@for n in 2 4 8; do \
+	  for cfg in "1 0" "12 0" "7 0.3"; do \
+	    set -- $$cfg; \
+	    echo "=== wdma N=$$n AXI_LAT=$$1 AXI_STALL=$$2 ==="; \
+	    $(MAKE) -s MODULE_NAME=wdma N=$$n AXI_LAT=$$1 AXI_STALL=$$2 || exit 1; \
+	  done; \
+	done
+	@echo "=== wdma B_ADDR_W=8 (small B: range errors near the top) ==="
+	@$(MAKE) -s MODULE_NAME=wdma N=4 B_ADDR_W=8 AXI_LAT=2 || exit 1
+	@echo "=== wdma sweep passed ==="
+
 # the descriptor sequencer driving the real layer_engine: random LeNet /
 # ResNet-style programs, errors, reset mid-program, back-to-back programs
 sweep-seq:
@@ -473,15 +524,35 @@ sweep-seq:
 	done
 	@echo "=== seq N=4 READ_LATENCY=2 DESC_DEPTH=16 (index wrap) ==="
 	@$(MAKE) -s MODULE_NAME=seq_harness N=4 READ_LATENCY=2 ADDR_WIDTH=10 DESC_DEPTH=16 || exit 1
+	@for n in 2 4 8; do \
+	  for rl in 1 2; do \
+	    echo "=== seq + wdma N=$$n READ_LATENCY=$$rl, mixed weights, AXI_LAT=3 ==="; \
+	    $(MAKE) -s MODULE_NAME=seq_harness N=$$n READ_LATENCY=$$rl ADDR_WIDTH=10 SEQ_HAS_DMA=1 AXI_LAT=3 || exit 1; \
+	  done; \
+	done
+	@echo "=== seq + wdma N=8 READ_LATENCY=2, DDR weights, AXI_LAT=9, 30 % backpressure ==="
+	@$(MAKE) -s MODULE_NAME=seq_harness N=8 READ_LATENCY=2 ADDR_WIDTH=10 SEQ_HAS_DMA=1 AXI_LAT=9 AXI_STALL=0.3 SEQ_WEIGHTS=ddr || exit 1
 	@echo "=== seq sweep passed ==="
 
-# whole networks through the UART pins at N=8 (sweep-top runs them at N=2/4
-# along with everything else)
+# whole networks: through the UART pins at N=8 (sweep-top runs them at N=2/4
+# along with everything else), with and without wdma; then LeNet-5, ResNet-8
+# and ResNet-20 at full size (32x32x3) on the sequencer and the real engine,
+# the ResNets with every conv's weights in DDR
 sweep-net:
 	@for rl in 1 2; do \
 	  echo "=== net N=8 READ_LATENCY=$$rl CLKS_PER_BIT=8 ==="; \
 	  $(MAKE) -s MODULE_NAME=top N=8 READ_LATENCY=$$rl ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
 	    COCOTB_TEST_FILTER='test_.*program' || exit 1; \
+	done
+	@echo "=== net + wdma N=8 READ_LATENCY=1 AXI_LAT=12 ==="
+	@$(MAKE) -s MODULE_NAME=top N=8 READ_LATENCY=1 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
+	  TOP_HAS_DMA=1 AXI_LAT=12 COCOTB_TEST_FILTER='test_.*program' || exit 1
+	@for cfg in "lenet 2 7 0.2 mixed" "resnet8 1 12 0 ddr" "resnet20 1 12 0 ddr"; do \
+	  set -- $$cfg; \
+	  echo "=== $$1 32x32x3 N=8 READ_LATENCY=$$2 AXI_LAT=$$3 AXI_STALL=$$4 weights $$5 ==="; \
+	  $(MAKE) -s MODULE_NAME=seq_harness N=8 READ_LATENCY=$$2 ADDR_WIDTH=12 DESC_DEPTH=64 \
+	    SEQ_HAS_DMA=1 AXI_LAT=$$3 AXI_STALL=$$4 SEQ_WEIGHTS=$$5 NET_PLAN=$$1 \
+	    COCOTB_TEST_FILTER=test_full_network || exit 1; \
 	done
 	@echo "=== net sweep passed ==="
 
@@ -490,4 +561,4 @@ sweep-net:
 check-flow:
 	@python3 ci/check_flow.py Makefile
 
-sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net
+sweep-all: check-flow sweep sweep-pe sweep-array sweep-ctrl sweep-requant sweep-bram sweep-skid sweep-gemm sweep-im2col sweep-act sweep-conv sweep-uart sweep-csr sweep-top sweep-pool sweep-engine sweep-add sweep-seq sweep-net sweep-dma

@@ -13,12 +13,14 @@ from typing import List, Optional
 
 import add_model as AM
 import conv_layer_model as CM
+import dma_model as DM
 from layer_engine_model import (OP_ADD, OP_CONV, OP_GAVG, OP_MAX2, Banks, add_cmd_of, apply_add,
                                 apply_conv, apply_pool, check, pool_cmd_of)
 import pool_model as PM
 
 OP_END = 0
 E_NOEND = 10
+E_NODMA = 15        # a DDR layer in a build without wdma; wdma's own codes sit at bits 14:11
 
 
 @dataclass
@@ -35,6 +37,7 @@ class SeqResult:
     err_index: Optional[int] = None
     err_code: int = 0
     outputs: List[list] = field(default_factory=list)   # words each finished layer wrote
+    fetch_cycles: List[int] = field(default_factory=list)   # per finished layer, 0 if on chip
 
 
 def layer_cycles(op, fields, n, read_latency, m_bits):
@@ -46,15 +49,33 @@ def layer_cycles(op, fields, n, read_latency, m_bits):
 
 
 def run(steps: List[Step], banks: Banks, hw: CM.HwParams, read_latency: int, m_bits: int = 8,
-        desc_depth: int = 32, first: int = 0) -> SeqResult:
+        desc_depth: int = 32, first: int = 0, ddr=None, has_dma: bool = True, axi_latency: int = 1,
+        bad=None) -> SeqResult:
     """steps[i] is descriptor first + i. stops at END, at the first error, or
-    after the last descriptor of the RAM (E_NOEND)"""
+    after the last descriptor of the RAM (E_NOEND). a CONV with w_ddr first
+    fetches its B and P from `ddr` (dma_model); its fetch cycles assume a
+    slave with `axi_latency` and no backpressure. the conv itself is computed
+    from step.layer, so a fetch that brought the wrong bytes shows up as a
+    board/model mismatch, never as a model error"""
     r = SeqResult()
     n = hw.n
     for i, s in enumerate(steps):
         idx = first + i
         if s.op == OP_END:
             return r
+        fetch = 0
+        if s.op == OP_CONV and s.fields.get("w_ddr"):
+            if not has_dma:
+                r.err_index, r.err_code = idx, 1 << E_NODMA
+                return r
+            f = s.fields
+            res = DM.fetch(ddr, DM.Fetch(f["b_src"], f["p_src"], f["k_words"], f["cout_words"],
+                                         f["b_base"], f["p_base"]), n, hw.b_addr_w, hw.p_addr_w,
+                           bad=bad or (lambda a: False))
+            if res.err:
+                r.err_index, r.err_code = idx, res.err << 11
+                return r
+            fetch = DM.estimate_cycles(res, axi_latency)
         code = check(s.op, s.fields, hw)
         if code:
             r.err_index, r.err_code = idx, code
@@ -67,6 +88,7 @@ def run(steps: List[Step], banks: Banks, hw: CM.HwParams, read_latency: int, m_b
             out = apply_add(banks, s.fields, n)
         r.outputs.append(out)
         r.cycles.append(layer_cycles(s.op, s.fields, n, read_latency, m_bits))
+        r.fetch_cycles.append(fetch)
         r.layers_done += 1
         if idx == desc_depth - 1:
             r.err_index, r.err_code = idx, 1 << E_NOEND
@@ -130,6 +152,33 @@ if __name__ == "__main__":
     # no END: the last descriptor of the RAM runs, then E_NOEND
     r = run([Step(OP_MAX2, mp)] * 2, Banks(3, 1 << 10), hw, 1, desc_depth=4, first=2)
     chk("E_NOEND after the last descriptor", (r.layers_done, r.err_index, r.err_code), (2, 3, 1 << E_NOEND))
+
+    # weights from DDR (phase 4): the same conv, its B and P placed in a DDR
+    # image instead of on chip, gives the same output; wdma errors stop it
+    ddr = bytearray(1 << 16)
+    kk = CM.k_of(3, 3, 1, n)
+    for i, wd in enumerate(CM.pack_b(l1.w, n)):
+        ddr[0x1000 + 8 * i:0x1000 + 8 * i + 8] = wd.to_bytes(8, "little")
+    for i, pe in enumerate(CM.pack_p(l1, n)):
+        ddr[0x8000 + 8 * i:0x8000 + 8 * i + 8] = pe.to_bytes(8, "little")
+    dd = dict(conv_bus(l1, n), w_ddr=1, k_words=kk, b_src=0x1000, p_src=0x8000)
+    banks = Banks(3, 1 << 10)
+    banks.write(0, 0, pack_act(x, n, l1.zp_in))
+    r = run([Step(OP_CONV, dd, l1), Step(OP_END, {})], banks, hw, 1, ddr=ddr, axi_latency=5)
+    chk("DDR conv: same output as on chip", unpack_act(banks.read(1, 0, 64), 8, 8, n, n), y1)
+    res = DM.fetch(ddr, DM.Fetch(0x1000, 0x8000, kk, 1, 0, 0), n, hw.b_addr_w, hw.p_addr_w)
+    chk("the fetch brings exactly the packed B and P",
+        ([v for _, v in res.b_writes], [v for _, v in res.p_writes]),
+        (CM.pack_b(l1.w, n), [p & ((1 << 53) - 1) for p in CM.pack_p(l1, n)]))
+    chk("DDR conv: fetch cycles from the wdma formula", r.fetch_cycles, [DM.estimate_cycles(res, 5)])
+    r = run([Step(OP_CONV, dict(dd, b_src=0x1004), l1), Step(OP_END, {})], Banks(3, 1 << 10), hw, 1,
+            ddr=ddr)
+    chk("misaligned b_src: wdma E_ALIGN at bit 12", (r.layers_done, r.err_index, r.err_code),
+        (0, 0, DM.E_ALIGN << 11))
+    r = run([Step(OP_MAX2, mp), Step(OP_CONV, dd, l1), Step(OP_END, {})], Banks(3, 1 << 10), hw, 1,
+            ddr=ddr, has_dma=False)
+    chk("a DDR layer without wdma: E_NODMA", (r.layers_done, r.err_index, r.err_code),
+        (1, 1, 1 << E_NODMA))
 
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
     raise SystemExit(1 if fails else 0)

@@ -11,6 +11,9 @@ The CSR runs against:
     while it runs it drives the conv stub's busy/done like the shared engine
     does, so the legacy STATUS/CYCLES gating is exercised; it fills the cycle
     RAM, whose read pipeline is READ_LATENCY deep like the act_buffer's;
+  - a stub for wdma's host port (map 2.1, HAS_DMA = 1): each DDR request is
+    answered after a random 1-6 edges from its own memory, with SLVERR on
+    chosen addresses;
   - csr_model.CsrModel, which predicts every response, every read value and
     every memory write the CSR commits.
 Sampling is in the ReadOnly phase; the stub and the BFM drive on the falling
@@ -29,13 +32,13 @@ from protocol import (A_ACT_WCRC, A_B_WCRC, A_BUILD_ID, A_CMD0, A_CTRL, A_CYCLES
                       A_ERR_CODE, A_ID, A_LAUNCH, A_P_WCRC, A_PARAMS0, A_PARAMS1, A_PARAMS2,
                       A_SCRATCH, A_SEQ_CTRL, A_SEQ_ERR, A_SEQ_STATUS, A_STATUS, A_VERSION,
                       ACT_BASE, B_BASE, CMD_FIELDS, CYC_BASE, DESC_BASE, P_BASE, P_WIDTH,
-                      slot_shift)
+                      A_DDR_BASE, A_DDR_WCRC, DDR_WIN, slot_shift)
 
 REGS = [A_ID, A_VERSION, A_PARAMS0, A_PARAMS1, A_CTRL, A_STATUS, A_ERR_CODE, A_CYCLES,
         A_SCRATCH, A_BUILD_ID, A_ACT_WCRC, A_B_WCRC, A_P_WCRC, A_LAUNCH, A_PARAMS2,
-        A_SEQ_CTRL, A_SEQ_STATUS, A_SEQ_ERR, A_DESC_WCRC] + \
+        A_SEQ_CTRL, A_SEQ_STATUS, A_SEQ_ERR, A_DESC_WCRC, A_DDR_BASE, A_DDR_WCRC] + \
        [A_CMD0 + 4 * i for i in range(len(CMD_FIELDS))]
-HOLES = (0x3C, 0x8C, 0xA0, 0xFC, 0x600000, 0xF00000)
+HOLES = (0x3C, 0x8C, 0xA8, 0xFC, 0x600000, 0x7FFFFC)
 
 
 def junk(sel, addr, n):
@@ -55,6 +58,13 @@ class CsrHarness:
                               build_id=g("BUILD_ID"), desc_depth=g("DESC_DEPTH"),
                               m_bits=g("M_BITS"), has_dma=g("HAS_DMA"))
         self.desc_depth = g("DESC_DEPTH")
+        self.has_dma = g("HAS_DMA")
+        # DDR: the model's memory and the stub's are separate and compared
+        self.ddr_bad = set()
+        self.model_ddr, self.stub_ddr = {}, {}
+        self.model.ddr = self._model_ddr
+        self.ddr_reqs = []              # (we, addr, data) as the stub saw them
+        self.ddr_pending = None         # [edges left, we, addr, data]
         self.sel_w = self.model.sel_w
         self.seed = int(os.environ.get("SEED") or random.randrange(2**31))
         self.rng = random.Random(self.seed)
@@ -89,6 +99,14 @@ class CsrHarness:
 
     def word(self, sel, addr):
         return self.mem.get((sel, addr), junk(sel, addr, self.n))
+
+    def _model_ddr(self, we, a, d):
+        if a in self.ddr_bad:
+            return 2, 0
+        if we:
+            self.model_ddr[a] = d
+            return 0, 0
+        return 0, self.model_ddr.get(a, junk(77, a, 4))
 
     def cyc_word(self, i):
         return self.cyc.get(i, junk(99, i, 4))
@@ -129,6 +147,7 @@ class CsrHarness:
         d.seq_err_index.value = self.seq_vals["err_index"]
         d.seq_err_code.value = self.seq_vals["err_code"]
         d.cyc_rd_data.value = self.cpipe[self.lat - 1]
+        d.ddr_ack.value = 0
         self.model.seq = dict(self.seq_vals, busy=self.seq_busy)
 
     async def _stub(self):
@@ -141,7 +160,7 @@ class CsrHarness:
                 "host_wdata", "host_wr_sel", "host_rd_en", "host_rd_addr", "host_rd_sel",
                 "b_we", "b_waddr", "b_wdata", "p_we", "p_waddr", "p_wdata", "seq_start",
                 "seq_start_index", "desc_we", "desc_waddr", "desc_wdata", "cyc_rd_en",
-                "cyc_rd_addr")}
+                "cyc_rd_addr", "ddr_req", "ddr_we", "ddr_addr", "ddr_wdata")}
             await RisingEdge(d.clk)
             # --- the edge: the sequencer (reset by soft reset, like top wires it)
             self.seq_done = self.seq_err = 0
@@ -199,6 +218,25 @@ class CsrHarness:
                     self.cyc_runs.append(self._crun)
             else:
                 self._crun = None
+            # --- the edge: wdma's host port, one access at a time
+            ack = None
+            if s["ddr_req"]:
+                assert self.ddr_pending is None, "a second DDR request before the first was answered"
+                assert self.has_dma, "a DDR request in a build without wdma"
+                self.ddr_reqs.append((s["ddr_we"], s["ddr_addr"], s["ddr_wdata"] if s["ddr_we"] else 0))
+                self.ddr_pending = [self.rng.randint(1, 6), s["ddr_we"], s["ddr_addr"], s["ddr_wdata"]]
+            elif self.ddr_pending is not None:
+                self.ddr_pending[0] -= 1
+                if self.ddr_pending[0] == 0:
+                    _, we, a, dat = self.ddr_pending
+                    self.ddr_pending = None
+                    if a in self.ddr_bad:
+                        ack = (2, 0)
+                    elif we:
+                        self.stub_ddr[a] = dat
+                        ack = (0, 0)
+                    else:
+                        ack = (0, self.stub_ddr.get(a, junk(77, a, 4)))
             # --- the edge: conv_layer
             self.done = self.err = 0
             if self.prog is not None or prog_done_pulse:
@@ -250,6 +288,10 @@ class CsrHarness:
                 self._run = None
             await FallingEdge(d.clk)
             self._drive_stub()
+            if ack is not None:
+                d.ddr_ack.value = 1
+                d.ddr_resp.value = ack[0]
+                d.ddr_rdata.value = ack[1]
             await ReadOnly()
 
     # -- AXI4-Lite master --------------------------------------------------------
@@ -350,11 +392,14 @@ class CsrHarness:
         await self.idle(2)
         assert self.commits == self.model.commits, \
             f"memory writes differ after {addr:#08x}: rtl {self.commits[-2:]} model {self.model.commits[-2:]}"
+        assert self.ddr_reqs == self.model.ddr_log and self.stub_ddr == self.model_ddr, \
+            f"DDR accesses differ after {addr:#08x}: rtl {self.ddr_reqs[-2:]} model {self.model.ddr_log[-2:]}"
         return got
 
     async def chk_read(self, addr, **kw):
         exp = self.model.read(addr, busy=self.any_busy, err_code=self.err_code, mem=self.word,
                               cyc=self.cyc_word)
+        n_req = len(self.ddr_reqs)
         runs, cruns = len(self.rd_runs), len(self.cyc_runs)
         live = addr == A_CYCLES and self.busy and not self.seq_busy
         lo = self.busy_edges
@@ -373,6 +418,8 @@ class CsrHarness:
                 f"host_rd_en runs {new_runs}, expected one run of {self.lat} edges at one address"
         else:
             assert not new_runs, f"host_rd_en moved for a read that is not a good ACT read: {new_runs}"
+        assert self.ddr_reqs == self.model.ddr_log, \
+            f"DDR accesses differ after reading {addr:#08x}: rtl {self.ddr_reqs[n_req:]}"
         new_cruns = self.cyc_runs[cruns:]
         if (addr >> 20) == 5 and resp == OKAY:
             assert len(new_cruns) == 1 and new_cruns[0][1] == self.lat, \
@@ -453,6 +500,8 @@ async def test_register_read_write(dut):
                 v &= 0x4            # start/soft reset/clear have their own tests
             if a == A_SEQ_CTRL:
                 v &= ~1             # program start has its own test
+            if a == A_DDR_BASE:
+                v &= 0x7F800000     # stay inside the stub's address space
             await h.chk_write(a, v)
             await h.chk_read(a)
     for a in HOLES:
@@ -643,7 +692,7 @@ async def test_random_traffic(dut):
     errors and short layers, all against the model"""
     h = await fresh(dut)
     sa = 1 << slot_shift(8 * h.n)
-    addrs = REGS + [0x3C, 0xA0, 0x7FFFFC]
+    addrs = REGS + [0x3C, 0xA8, 0x7FFFFC]
     for i in range(600):
         kind = h.rng.random()
         kw = dict(order=h.rng.choice(("same", "aw", "w")), gap=h.rng.choice((0, 0, 2)),
@@ -837,3 +886,56 @@ async def test_program_busy_rules(dut):
     await h.settle()
     await h.chk_read(A_SEQ_STATUS)
     assert h.seq_starts == h.model.seq_starts
+
+
+@cocotb.test()
+async def test_ddr_window(dut):
+    """map 2.1. without wdma: the window, DDR_BASE and DDR_WCRC are DECERR and
+    no DDR request ever leaves. with it: writes and reads of both halves of
+    the 64-bit word land at DDR_BASE | offset and come back; B and R wait for
+    DDR (random 1-6 edges) and carry its answer; SLVERR from DDR passes
+    through and leaves DDR_WCRC alone; DDR_WCRC covers every accepted word,
+    clear_wcrc resets it; a program running refuses DDR access and DDR_BASE;
+    interleaved with register traffic and held-off B/R"""
+    h = await fresh(dut)
+    if not h.has_dma:
+        for a in (DDR_WIN, DDR_WIN + 0x7FFFFC, 0xF00000, A_DDR_BASE, A_DDR_WCRC):
+            await h.chk_write(a, 0x1234)
+            await h.chk_read(a)
+        assert not h.ddr_reqs
+        return
+    await h.chk_write(A_CTRL, 8)
+    for page in (0, 1, 5):
+        await h.chk_write(A_DDR_BASE, page << 23)
+        await h.chk_read(A_DDR_BASE)
+        for i in range(12):
+            off = 4 * h.rng.randrange(0, 1 << 21)
+            kw = dict(order=h.rng.choice(("same", "aw", "w")), bdelay=h.rng.choice((0, 0, 3)))
+            await h.chk_write(DDR_WIN + off, h.rng.getrandbits(32), **kw)
+            await h.chk_read(DDR_WIN + off, rdelay=h.rng.choice((0, 2)))
+            await h.chk_read(DDR_WIN + (off ^ 4))           # the other half of the 64-bit word
+            await h.chk_read(A_DDR_WCRC)
+            if i % 4 == 0:
+                await h.chk_write(A_SCRATCH, i)
+    # DDR answers SLVERR at one address: passes through, CRC unchanged
+    bad = (1 << 23) | 0x40
+    h.ddr_bad.add(bad)
+    await h.chk_write(A_DDR_BASE, 1 << 23)
+    await h.chk_write(DDR_WIN + 0x40, 0xBAD)
+    await h.chk_read(DDR_WIN + 0x40)
+    await h.chk_read(A_DDR_WCRC)
+    h.ddr_bad.clear()
+    await h.chk_write(A_CTRL, 8)
+    await h.chk_read(A_DDR_WCRC)
+    # a program running: refused, and no request leaves
+    h.next_prog = ([100000], 0)
+    await h.chk_write(A_SEQ_CTRL, 1)
+    await h.idle(3)
+    n = len(h.ddr_reqs)
+    await h.chk_write(DDR_WIN + 8, 1)
+    await h.chk_read(DDR_WIN + 8)
+    await h.chk_write(A_DDR_BASE, 2 << 23)
+    assert len(h.ddr_reqs) == n, "a DDR access went out while a program ran"
+    await h.chk_write(A_CTRL, 2)
+    await h.idle(2)
+    await h.chk_read(A_DDR_BASE)
