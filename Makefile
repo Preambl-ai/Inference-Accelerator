@@ -32,12 +32,16 @@ ADD_NBUF ?= 3
 DESC_DEPTH ?= 32
 SEQ_HAS_DMA ?= 0
 CSR_HAS_DMA ?= 0
+# top with wdma and the DDR port (the TB's AXI4 slave plays the MIG)
+TOP_HAS_DMA ?= 0
 SEQ_WEIGHTS ?=
 export SEQ_WEIGHTS
 LAYERS ?=
 export LAYERS
 SEED ?=
 export SEED
+NET_PLAN ?=
+export NET_PLAN
 export K
 export N
 export ALLOW_K0
@@ -178,6 +182,7 @@ VERILOG_SOURCES += $(PWD)/csr/rtl/csr.sv $(PWD)/uart/rtl/uart_rx.sv $(PWD)/uart/
 VERILOG_SOURCES += $(PWD)/uart/rtl/uart_bridge.sv $(PWD)/layer_engine/rtl/layer_engine.sv
 VERILOG_SOURCES += $(PWD)/pool/rtl/pool_layer.sv $(PWD)/add/rtl/add_layer.sv $(CONV_SRCS)
 VERILOG_SOURCES += $(PWD)/sequencer/rtl/sequencer.sv
+VERILOG_SOURCES += $(PWD)/dma/rtl/wdma.sv $(PWD)/dma/rtl/ddr_port.sv
 COMPILE_ARGS += -Ptop.N=$(N)
 COMPILE_ARGS += -Ptop.READ_LATENCY=$(READ_LATENCY)
 COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
@@ -185,7 +190,8 @@ COMPILE_ARGS += -Ptop.ADDR_WIDTH=$(ADDR_WIDTH)
 COMPILE_ARGS += -Ptop.CLKS_PER_BIT=$(CLKS_PER_BIT)
 COMPILE_ARGS += -Ptop.TIMEOUT_BITS=$(TIMEOUT_BITS)
 COMPILE_ARGS += -Ptop.HB_BIT=6
-SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)
+COMPILE_ARGS += -Ptop.HAS_DMA=$(TOP_HAS_DMA)
+SIM_BUILD = sim_build/top_n_$(N)_rl_$(READ_LATENCY)_aw_$(ADDR_WIDTH)_cpb_$(CLKS_PER_BIT)_dma_$(TOP_HAS_DMA)
 endif
 
 ifeq ($(MODULE_NAME),pool_harness)
@@ -445,6 +451,12 @@ sweep-top:
 	  echo "=== top N=$$1 READ_LATENCY=$$2 CLKS_PER_BIT=8 ==="; \
 	  $(MAKE) -s MODULE_NAME=top N=$$1 READ_LATENCY=$$2 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 || exit 1; \
 	done
+	@for cfg in "2 1 3 0" "4 2 9 0.3"; do \
+	  set -- $$cfg; \
+	  echo "=== top + wdma N=$$1 READ_LATENCY=$$2 AXI_LAT=$$3 AXI_STALL=$$4 ==="; \
+	  $(MAKE) -s MODULE_NAME=top N=$$1 READ_LATENCY=$$2 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
+	    TOP_HAS_DMA=1 AXI_LAT=$$3 AXI_STALL=$$4 || exit 1; \
+	done
 	@echo "=== top sweep passed ==="
 
 # pool_layer on the real act_buffer. NBUF=3 leaves bank select 3 unused, so the
@@ -522,13 +534,25 @@ sweep-seq:
 	@$(MAKE) -s MODULE_NAME=seq_harness N=8 READ_LATENCY=2 ADDR_WIDTH=10 SEQ_HAS_DMA=1 AXI_LAT=9 AXI_STALL=0.3 SEQ_WEIGHTS=ddr || exit 1
 	@echo "=== seq sweep passed ==="
 
-# whole networks through the UART pins at N=8 (sweep-top runs them at N=2/4
-# along with everything else)
+# whole networks: through the UART pins at N=8 (sweep-top runs them at N=2/4
+# along with everything else), with and without wdma; then LeNet-5, ResNet-8
+# and ResNet-20 at full size (32x32x3) on the sequencer and the real engine,
+# the ResNets with every conv's weights in DDR
 sweep-net:
 	@for rl in 1 2; do \
 	  echo "=== net N=8 READ_LATENCY=$$rl CLKS_PER_BIT=8 ==="; \
 	  $(MAKE) -s MODULE_NAME=top N=8 READ_LATENCY=$$rl ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
 	    COCOTB_TEST_FILTER='test_.*program' || exit 1; \
+	done
+	@echo "=== net + wdma N=8 READ_LATENCY=1 AXI_LAT=12 ==="
+	@$(MAKE) -s MODULE_NAME=top N=8 READ_LATENCY=1 ADDR_WIDTH=8 CLKS_PER_BIT=8 TIMEOUT_BITS=40 \
+	  TOP_HAS_DMA=1 AXI_LAT=12 COCOTB_TEST_FILTER='test_.*program' || exit 1
+	@for cfg in "lenet 2 7 0.2 mixed" "resnet8 1 12 0 ddr" "resnet20 1 12 0 ddr"; do \
+	  set -- $$cfg; \
+	  echo "=== $$1 32x32x3 N=8 READ_LATENCY=$$2 AXI_LAT=$$3 AXI_STALL=$$4 weights $$5 ==="; \
+	  $(MAKE) -s MODULE_NAME=seq_harness N=8 READ_LATENCY=$$2 ADDR_WIDTH=12 DESC_DEPTH=64 \
+	    SEQ_HAS_DMA=1 AXI_LAT=$$3 AXI_STALL=$$4 SEQ_WEIGHTS=$$5 NET_PLAN=$$1 \
+	    COCOTB_TEST_FILTER=test_full_network || exit 1; \
 	done
 	@echo "=== net sweep passed ==="
 
